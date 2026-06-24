@@ -2,6 +2,7 @@
 *.pyc
 __pycache__/
 research_outputs/
+boards/
 user_network_graph.json
 user_network_profiles.csv
 *.csv

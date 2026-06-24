@@ -26,6 +26,7 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 DATA_DIR = os.path.abspath(os.environ.get("ARTEMIS_DATA_DIR", PROJECT_ROOT))
 OUTPUT_DIR = os.path.join(DATA_DIR, "research_outputs")
+BOARD_DIR = os.path.join(DATA_DIR, "boards")
 NETWORK_GRAPH_PATH = os.path.join(DATA_DIR, "user_network_graph.json")
 NETWORK_CSV_PATH = os.path.join(DATA_DIR, "user_network_profiles.csv")
 FALLBACK_NETWORK_CSV_PATH = os.path.join(PROJECT_ROOT, "linkedin_network_profiles.csv")
@@ -337,6 +338,203 @@ def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit):
     return {"terms": terms, "routes": routes}
 
 
+def board_node_id(person, index):
+    raw = normalize_url(person.get("profile_url", "")) or person.get("name", "") or f"node-{index}"
+    key = re.sub(r"[^a-z0-9]+", "-", str(raw).lower()).strip("-")
+    return key or f"node-{index}"
+
+
+def board_from_routes(job_id, person, context, routes_payload):
+    routes = (routes_payload or {}).get("routes", [])[:8]
+    has_working_path = any(route.get("type") not in {"near_miss"} for route in routes)
+    nodes = {}
+    edges = []
+    leads = []
+
+    for route_index, route in enumerate(routes):
+        path = route.get("path", [])
+        route_type = route.get("type") or "candidate"
+        highlighted = has_working_path and route_type != "near_miss"
+        for depth, person_item in enumerate(path):
+            node_id = board_node_id(person_item, depth)
+            role = "target" if depth == len(path) - 1 else "lead" if depth > 0 else "me"
+            existing = nodes.get(node_id, {})
+            nodes[node_id] = {
+                "id": node_id,
+                "name": person_item.get("name", "Unknown"),
+                "company": person_item.get("company", ""),
+                "position": person_item.get("position", ""),
+                "profile_url": person_item.get("profile_url", ""),
+                "depth": depth,
+                "role": existing.get("role") if existing.get("role") == "target" else role,
+                "source": "path_search",
+                "highlighted": bool(existing.get("highlighted") or highlighted),
+                "route_count": int(existing.get("route_count", 0)) + 1,
+            }
+            if depth > 0:
+                source = board_node_id(path[depth - 1], depth - 1)
+                edge_key_value = f"{source}->{node_id}:{route_index}"
+                edges.append(
+                    {
+                        "key": edge_key_value,
+                        "source": source,
+                        "target": node_id,
+                        "route": route_index,
+                        "type": route_type,
+                        "highlighted": highlighted,
+                    }
+                )
+        if path:
+            lead_person = route.get("profile") or (path[1] if len(path) > 1 else path[0])
+            leads.append(
+                {
+                    "rank": route.get("rank") or route_index + 1,
+                    "name": lead_person.get("name", ""),
+                    "company": lead_person.get("company", ""),
+                    "position": lead_person.get("position", ""),
+                    "profile_url": lead_person.get("profile_url", ""),
+                    "score": route.get("score", ""),
+                    "type": route_type,
+                    "confidence": route.get("confidence", ""),
+                    "ask": (
+                        "Validate this warm path before outreach."
+                        if highlighted
+                        else "Best cold-email lead connected to the target-side map."
+                    ),
+                    "explanation": route.get("explanation", ""),
+                }
+            )
+
+    board = {
+        "id": job_id,
+        "target": person,
+        "context": context,
+        "summary": {
+            "working_paths": sum(1 for route in routes if route.get("type") != "near_miss"),
+            "near_misses": sum(1 for route in routes if route.get("type") == "near_miss"),
+            "leads": len(leads),
+        },
+        "nodes": list(nodes.values()),
+        "edges": edges,
+        "leads": leads,
+    }
+    save_board(board)
+    return board
+
+
+def board_path(board_id):
+    safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(board_id or "")).strip("._")
+    if not safe_id:
+        raise ValueError("Board id is required.")
+    return os.path.join(BOARD_DIR, f"{safe_id}.json")
+
+
+def save_board(board):
+    os.makedirs(BOARD_DIR, exist_ok=True)
+    with open(board_path(board["id"]), "w", encoding="utf-8") as file:
+        json.dump(board, file, indent=2)
+
+
+def load_board(board_id):
+    path = board_path(board_id)
+    if not os.path.exists(path):
+        raise ValueError("Board not found.")
+    with open(path, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def add_board_node(board_id, payload):
+    board = load_board(board_id)
+    parent_id = payload.get("parent_id") or ""
+    node = {
+        "name": (payload.get("name") or "").strip(),
+        "company": (payload.get("company") or "").strip(),
+        "position": (payload.get("position") or "").strip(),
+        "profile_url": normalize_url(payload.get("profile_url") or ""),
+    }
+    if not node["name"]:
+        raise ValueError("Name is required.")
+    node["id"] = f"manual-{board_node_id(node, len(board.get('nodes', [])))}"
+    node["depth"] = int(payload.get("depth") or 1)
+    node["role"] = "manual"
+    node["source"] = "manual"
+    node["highlighted"] = False
+    node["route_count"] = 0
+    existing_ids = {item.get("id") for item in board.get("nodes", [])}
+    while node["id"] in existing_ids:
+        node["id"] = f"{node['id']}-1"
+    board.setdefault("nodes", []).append(node)
+    if parent_id and parent_id in existing_ids:
+        board.setdefault("edges", []).append(
+            {
+                "key": f"{parent_id}->{node['id']}:manual",
+                "source": parent_id,
+                "target": node["id"],
+                "route": "manual",
+                "type": "manual",
+                "highlighted": False,
+            }
+        )
+    board.setdefault("leads", []).append(
+        {
+            "rank": len(board.get("leads", [])) + 1,
+            "name": node["name"],
+            "company": node["company"],
+            "position": node["position"],
+            "profile_url": node["profile_url"],
+            "score": "",
+            "type": "manual",
+            "confidence": "manually added",
+            "ask": "Research or contact manually.",
+            "explanation": "",
+        }
+    )
+    board["summary"] = {
+        **board.get("summary", {}),
+        "leads": len(board.get("leads", [])),
+    }
+    save_board(board)
+    return board
+
+
+def board_csv(board):
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "board_id",
+            "target",
+            "name",
+            "company",
+            "position",
+            "profile_url",
+            "role",
+            "depth",
+            "source",
+            "highlighted",
+            "route_count",
+        ],
+    )
+    writer.writeheader()
+    for node in board.get("nodes", []):
+        writer.writerow(
+            {
+                "board_id": board.get("id", ""),
+                "target": board.get("target", ""),
+                "name": node.get("name", ""),
+                "company": node.get("company", ""),
+                "position": node.get("position", ""),
+                "profile_url": node.get("profile_url", ""),
+                "role": node.get("role", ""),
+                "depth": node.get("depth", ""),
+                "source": node.get("source", ""),
+                "highlighted": node.get("highlighted", False),
+                "route_count": node.get("route_count", 0),
+            }
+        )
+    return output.getvalue()
+
+
 FRONTEND_DIR = os.path.join(PROJECT_ROOT, "frontend")
 
 
@@ -438,7 +636,8 @@ def run_job(job_id, payload):
         update_job(job_id, message="Checking graph/network matches...", log=f"Checking network matches in {profiles_csv}.")
         research_person_and_network.build_network_matches(args, dossier_path, matches_path)
         routes = route_payload(dossier_path, profiles_csv, args.extra_term, args.min_score, args.match_limit)
-        update_job(job_id, status="done", message="Complete.", files={"dossier": dossier_path, "matches": matches_path}, dossier=read_file(dossier_path), matches=read_file(matches_path), routes=routes, log=f"Saved network matches: {matches_path}")
+        board = board_from_routes(job_id, person, context, routes)
+        update_job(job_id, status="done", message="Complete.", files={"dossier": dossier_path, "matches": matches_path}, dossier=read_file(dossier_path), matches=read_file(matches_path), routes=routes, board=board, log=f"Saved network matches: {matches_path}")
     except Exception as error:
         update_job(job_id, status="error", message=str(error), log=traceback.format_exc(), dossier=read_file(dossier_path), matches=read_file(matches_path), files={"dossier": dossier_path, "matches": matches_path})
 
@@ -479,6 +678,30 @@ class ResearchHandler(BaseHTTPRequestHandler):
             with JOBS_LOCK:
                 job = JOBS.get(job_id)
             self.send_json(job or {"error": "Job not found."}, status=200 if job else 404)
+            return
+        if parsed.path.startswith("/api/boards/") and parsed.path.endswith("/csv"):
+            board_id = parsed.path.split("/")[-2]
+            try:
+                board = load_board(board_id)
+            except ValueError as error:
+                self.send_json({"error": str(error)}, status=404)
+                return
+            body = board_csv(board)
+            filename = f"{slugify(board.get('target', 'board'))}_board.csv"
+            encoded = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
+        if parsed.path.startswith("/api/boards/"):
+            board_id = parsed.path.rsplit("/", 1)[-1]
+            try:
+                self.send_json(load_board(board_id))
+            except ValueError as error:
+                self.send_json({"error": str(error)}, status=404)
             return
         if parsed.path == "/download":
             requested = parse_qs(parsed.query).get("path", [""])[0]
@@ -534,6 +757,12 @@ class ResearchHandler(BaseHTTPRequestHandler):
                 result = import_connections(file_item.file.read(), parent_id=parent_id, filename=filename, replace_root=replace_root)
                 self.send_json(result)
                 return
+            if self.path.startswith("/api/boards/") and self.path.endswith("/nodes"):
+                board_id = self.path.split("/")[-2]
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                self.send_json(add_board_node(board_id, payload))
+                return
             self.send_json({"error": "Not found."}, status=404)
         except Exception as error:
             self.send_json({"error": str(error)}, status=400)
@@ -550,6 +779,7 @@ def main():
     args = parse_args()
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(BOARD_DIR, exist_ok=True)
     if not os.path.exists(NETWORK_GRAPH_PATH):
         save_graph(empty_graph())
     server = ThreadingHTTPServer((args.host, args.port), ResearchHandler)
