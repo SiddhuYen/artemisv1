@@ -1,0 +1,561 @@
+import argparse
+import cgi
+import csv
+import io
+import json
+import os
+import re
+import sys
+import threading
+import time
+import traceback
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+import dossier_network_matcher
+import research_person_and_network
+
+
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+DATA_DIR = os.path.abspath(os.environ.get("ARTEMIS_DATA_DIR", PROJECT_ROOT))
+OUTPUT_DIR = os.path.join(DATA_DIR, "research_outputs")
+NETWORK_GRAPH_PATH = os.path.join(DATA_DIR, "user_network_graph.json")
+NETWORK_CSV_PATH = os.path.join(DATA_DIR, "user_network_profiles.csv")
+FALLBACK_NETWORK_CSV_PATH = os.path.join(PROJECT_ROOT, "linkedin_network_profiles.csv")
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+}
+
+
+def slugify(value):
+    return research_person_and_network.slugify(value)
+
+
+def normalize_url(url):
+    return str(url or "").strip().split("?", 1)[0].rstrip("/")
+
+
+def person_id(person):
+    url = normalize_url(person.get("profile_url") or person.get("URL"))
+    if url:
+        return f"url:{url.lower()}"
+    name = person.get("name") or " ".join(
+        part for part in [person.get("First Name", ""), person.get("Last Name", "")] if part
+    )
+    company = person.get("company") or person.get("Company", "")
+    key = re.sub(r"[^a-z0-9]+", "-", f"{name}-{company}".lower()).strip("-")
+    return f"person:{key or 'unknown'}"
+
+
+def profile_payload(row):
+    full_name = " ".join(part for part in [row.get("First Name", ""), row.get("Last Name", "")] if part).strip()
+    return {
+        "name": row.get("name") or full_name or "Unknown",
+        "company": row.get("company") or row.get("Company", ""),
+        "position": row.get("position") or row.get("Position", ""),
+        "profile_url": normalize_url(row.get("profile_url") or row.get("URL", "")),
+    }
+
+
+def format_person(person):
+    payload = profile_payload(person)
+    return " | ".join(part for part in [payload["name"], payload["company"], payload["position"], payload["profile_url"]] if part)
+
+
+def empty_graph():
+    return {
+        "nodes": {
+            "me": {
+                "id": "me",
+                "name": "You",
+                "company": "",
+                "position": "",
+                "profile_url": "",
+                "depth": 0,
+                "source": "root",
+            }
+        },
+        "edges": [],
+    }
+
+
+def load_graph():
+    if not os.path.exists(NETWORK_GRAPH_PATH):
+        return empty_graph()
+    with open(NETWORK_GRAPH_PATH, "r", encoding="utf-8") as file:
+        graph = json.load(file)
+    graph.setdefault("nodes", {})
+    graph.setdefault("edges", [])
+    graph["nodes"].setdefault("me", empty_graph()["nodes"]["me"])
+    return graph
+
+
+def save_graph(graph):
+    with open(NETWORK_GRAPH_PATH, "w", encoding="utf-8") as file:
+        json.dump(graph, file, indent=2)
+    write_network_csv(graph)
+
+
+def edge_key(source_id, target_id):
+    return f"{source_id}->{target_id}"
+
+
+def add_node(graph, person, source="manual", depth=1):
+    payload = profile_payload(person)
+    node_id = person.get("id") or person_id(payload)
+    existing = graph["nodes"].get(node_id, {})
+    node = {
+        "id": node_id,
+        "name": payload["name"] or existing.get("name", "Unknown"),
+        "company": payload["company"] or existing.get("company", ""),
+        "position": payload["position"] or existing.get("position", ""),
+        "profile_url": payload["profile_url"] or existing.get("profile_url", ""),
+        "depth": min(int(existing.get("depth", depth) or depth), depth),
+        "source": source or existing.get("source", ""),
+    }
+    graph["nodes"][node_id] = node
+    return node
+
+
+def add_edge(graph, source_id, target_id, source="manual"):
+    if source_id == target_id:
+        return
+    key = edge_key(source_id, target_id)
+    if any(edge.get("key") == key for edge in graph["edges"]):
+        return
+    graph["edges"].append({"key": key, "source": source_id, "target": target_id, "source_type": source})
+
+
+def parse_linkedin_csv_bytes(raw_bytes):
+    text = raw_bytes.decode("utf-8-sig", errors="replace")
+    lines = text.splitlines()
+    header_index = 0
+    for index, line in enumerate(lines):
+        lowered = line.lower()
+        if ("first name" in lowered and "last name" in lowered) or "profile_url" in lowered or "profile url" in lowered:
+            header_index = index
+            break
+    csv_text = "\n".join(lines[header_index:])
+    return list(csv.DictReader(io.StringIO(csv_text)))
+
+
+def import_connections(raw_bytes, parent_id="me", filename="upload.csv", replace_root=False):
+    rows = parse_linkedin_csv_bytes(raw_bytes)
+    graph = empty_graph() if replace_root else load_graph()
+    parent_id = parent_id or "me"
+    if parent_id not in graph["nodes"]:
+        parent_id = "me"
+    parent_depth = int(graph["nodes"].get(parent_id, {}).get("depth", 0) or 0)
+    added = 0
+    for row in rows:
+        payload = profile_payload(row)
+        if not payload["name"] or payload["name"] == "Unknown":
+            continue
+        node = add_node(graph, payload, source=filename, depth=parent_depth + 1)
+        add_edge(graph, parent_id, node["id"], source=filename)
+        added += 1
+    save_graph(graph)
+    return {"added": added, "total_nodes": len(graph["nodes"]), "total_edges": len(graph["edges"])}
+
+
+def adjacency(graph):
+    adj = {}
+    for edge in graph["edges"]:
+        adj.setdefault(edge["source"], []).append(edge["target"])
+    return adj
+
+
+def shortest_paths_from_me(graph):
+    adj = adjacency(graph)
+    paths = {"me": ["me"]}
+    queue = deque(["me"])
+    while queue:
+        node_id = queue.popleft()
+        for next_id in adj.get(node_id, []):
+            if next_id in paths:
+                continue
+            paths[next_id] = paths[node_id] + [next_id]
+            queue.append(next_id)
+    return paths
+
+
+def write_network_csv(graph):
+    paths = shortest_paths_from_me(graph)
+    with open(NETWORK_CSV_PATH, "w", encoding="utf-8", newline="") as file:
+        fieldnames = ["name", "company", "position", "profile_url", "graph_paths", "source", "depth"]
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for node_id, node in graph["nodes"].items():
+            if node_id == "me":
+                continue
+            path_ids = paths.get(node_id, ["me", node_id])
+            path_people = [
+                {
+                    "name": graph["nodes"].get(path_id, {}).get("name", ""),
+                    "company": graph["nodes"].get(path_id, {}).get("company", ""),
+                    "position": graph["nodes"].get(path_id, {}).get("position", ""),
+                    "profile_url": graph["nodes"].get(path_id, {}).get("profile_url", ""),
+                }
+                for path_id in path_ids
+            ]
+            writer.writerow(
+                {
+                    "name": node.get("name", ""),
+                    "company": node.get("company", ""),
+                    "position": node.get("position", ""),
+                    "profile_url": node.get("profile_url", ""),
+                    "graph_paths": json.dumps([path_people]),
+                    "source": node.get("source", ""),
+                    "depth": node.get("depth", ""),
+                }
+            )
+
+
+def graph_summary():
+    graph = load_graph()
+    if not os.path.exists(NETWORK_CSV_PATH):
+        write_network_csv(graph)
+    nodes = list(graph["nodes"].values())
+    return {
+        "nodes": nodes,
+        "edges": graph["edges"],
+        "stats": {
+            "nodes": len(nodes),
+            "edges": len(graph["edges"]),
+            "first_degree": sum(1 for node in nodes if node.get("depth") == 1),
+            "second_degree_plus": sum(1 for node in nodes if int(node.get("depth", 0) or 0) > 1),
+            "csv_path": NETWORK_CSV_PATH,
+            "data_dir": DATA_DIR,
+        },
+    }
+
+
+def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit):
+    dossier_text = dossier_network_matcher.read_text(dossier_path)
+    rows = dossier_network_matcher.load_profiles(profiles_csv)
+    artemis_map = dossier_network_matcher.artemis_map_from_dossier(dossier_text)
+    fallback_terms = dossier_network_matcher.unique(dossier_network_matcher.extract_terms(dossier_text) + extra_terms)
+    target_name = artemis_map.get("target") or "Target"
+    if artemis_map.get("closest_people"):
+        matches, clue_matches, _, bridge_terms, clue_terms = dossier_network_matcher.score_artemis_profiles(
+            rows, artemis_map, fallback_terms, min_score
+        )
+        terms = bridge_terms + clue_terms
+    else:
+        terms = fallback_terms
+        matches = dossier_network_matcher.score_profiles(rows, terms, min_score)
+        clue_matches = []
+    routes = []
+
+    def path_people_for_row(row, target_chain=None):
+        paths = dossier_network_matcher.parse_paths(row)
+        if paths:
+            people = [profile_payload(person) for person in paths[0]]
+        else:
+            people = [{"name": "You"}, profile_payload(row)]
+        for name in target_chain or []:
+            if not name:
+                continue
+            if people and people[-1].get("name") == name:
+                continue
+            people.append({"name": name, "company": "", "position": "", "profile_url": ""})
+        if target_name and (not people or people[-1].get("name") != target_name):
+            people.append({"name": target_name, "company": "", "position": "", "profile_url": ""})
+        return people
+
+    for index, match in enumerate(matches[:limit], 1):
+        row = match["row"]
+        snippets = match.get("snippets", [])[:8]
+        terms_hit = [snippet["term"] for snippet in snippets]
+        has_paths = bool(match.get("paths"))
+        score = min(0.95, 0.34 + (match["score"] * 0.09) + (0.05 if has_paths else 0))
+        target_people = match.get("target_people") or []
+        target_chain = []
+        if target_people:
+            target_chain = dossier_network_matcher.target_chain_for_node(target_people[0], artemis_map)
+        if artemis_map.get("closest_people"):
+            target_names = ", ".join(person.get("name", "") for person in target_people[:3]) or "the target-side map"
+            explanation = (
+                f"{format_person(row)} matched named endpoint-side bridge terms tied to {target_names}. "
+                "This is a bridge candidate until each hop is source-checked."
+            )
+        else:
+            explanation = f"Matched dossier terms: {', '.join(terms_hit[:5])}."
+        routes.append(
+            {
+                "rank": index,
+                "score": round(score, 2),
+                "raw_score": match["score"],
+                "type": "candidate",
+                "confidence": "possible - unverified bridge",
+                "profile": profile_payload(row),
+                "path": path_people_for_row(row, target_chain),
+                "terms": terms_hit,
+                "snippets": snippets,
+                "explanation": explanation,
+                "iffy_hop": f"{profile_payload(row)['name']} -> {target_people[0].get('name', 'target-side bridge')}" if target_people else "",
+            }
+        )
+
+    if not routes and artemis_map.get("closest_people"):
+        near_misses = dossier_network_matcher.near_miss_path_items(
+            [],
+            clue_matches,
+            artemis_map,
+            rejected_candidates=[],
+            limit=min(limit, 8),
+        )
+        for index, item in enumerate(near_misses, 1):
+            row = item["row"]
+            snippets = item.get("snippets", [])[:8]
+            target_chain = [name for name in item.get("target_chain", []) if name]
+            target_node = item.get("target_node", {})
+            routes.append(
+                {
+                    "rank": index,
+                    "score": round(min(0.72, 0.22 + (item.get("score", 0) * 0.08)), 2),
+                    "raw_score": item.get("score", 0),
+                    "type": "near_miss",
+                    "confidence": item.get("confidence", "near miss"),
+                    "profile": profile_payload(row),
+                    "path": path_people_for_row(row, target_chain),
+                    "terms": [snippet.get("term", "") for snippet in snippets],
+                    "snippets": snippets,
+                    "explanation": item.get("why", "This is the best route found so far, but one hop is not verified."),
+                    "iffy_hop": f"{profile_payload(row)['name']} -> {target_node.get('name', 'target-side clue')}",
+                }
+            )
+    return {"terms": terms, "routes": routes}
+
+
+FRONTEND_DIR = os.path.join(PROJECT_ROOT, "frontend")
+
+
+def read_static_file(relative_path):
+    normalized = os.path.normpath(relative_path).lstrip(os.sep)
+    path = os.path.join(FRONTEND_DIR, normalized)
+    if not os.path.abspath(path).startswith(os.path.abspath(FRONTEND_DIR)):
+        return None
+    if not os.path.exists(path) or not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as file:
+        return file.read()
+
+
+def make_job(payload):
+    person = (payload.get("person") or "").strip()
+    if not person:
+        raise ValueError("Person name is required.")
+    context = (payload.get("context") or "").strip()
+    job_id = f"{int(time.time() * 1000)}_{slugify(person)[:36]}"
+    with JOBS_LOCK:
+        JOBS[job_id] = {"id": job_id, "status": "queued", "person": person, "context": context, "log": ["Queued."], "message": "Queued.", "files": {}}
+    threading.Thread(target=run_job, args=(job_id, payload), daemon=True).start()
+    return job_id
+
+
+def update_job(job_id, **updates):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        for key, value in updates.items():
+            if key == "log":
+                job.setdefault("log", []).append(value)
+            else:
+                job[key] = value
+
+
+def read_file(path):
+    if not path or not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8") as file:
+        return file.read()
+
+
+def active_profiles_csv():
+    if os.path.exists(NETWORK_CSV_PATH):
+        return NETWORK_CSV_PATH
+    return FALLBACK_NETWORK_CSV_PATH
+
+
+def run_job(job_id, payload):
+    person = payload["person"].strip()
+    context = (payload.get("context") or "").strip()
+    output_dir = OUTPUT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+    base = slugify(" ".join(part for part in [person, context] if part))
+    dossier_path = os.path.join(output_dir, f"{base}_dossier.md")
+    matches_path = os.path.join(output_dir, f"{base}_network_matches.md")
+    profiles_csv = active_profiles_csv()
+    args = SimpleNamespace(
+        provider=None,
+        model=None,
+        env=".env",
+        profiles_csv=profiles_csv,
+        max_results=int(payload.get("max_results") or 8),
+        max_pages=int(payload.get("max_pages") or 8),
+        max_adjacent_queries=int(payload.get("max_adjacent_queries") or 20),
+        no_adjacent_pass=bool(payload.get("no_adjacent_pass")),
+        no_institution_pass=bool(payload.get("no_institution_pass")),
+        max_institution_queries=int(payload.get("max_institution_queries") or 10),
+        max_institution_followups=int(payload.get("max_institution_followups") or 8),
+        max_institution_pages=int(payload.get("max_institution_pages") or 6),
+        search_provider=payload.get("search_provider") or "brave",
+        use_apify_instagram=bool(payload.get("use_apify_instagram")),
+        allow_insecure_ssl=bool(payload.get("allow_insecure_ssl")),
+        extra_term=[],
+        min_score=1,
+        match_limit=int(payload.get("match_limit") or 50),
+        verify_hops=not bool(payload.get("no_verify_hops")),
+        verify_limit=int(payload.get("verify_limit") or 8),
+        verified_path_limit=int(payload.get("verified_path_limit") or 3),
+        verify_targets_per_match=int(payload.get("verify_targets_per_match") or 2),
+        verify_search_results=int(payload.get("verify_search_results") or 5),
+        seed_search_results=int(payload.get("seed_search_results") or 4),
+        seed_map=not bool(payload.get("no_seed_map")),
+        layer_expansion=not bool(payload.get("no_layer_expansion")),
+        expansion_layers=int(payload.get("expansion_layers") or 1),
+        expansion_frontier_limit=int(payload.get("expansion_frontier_limit") or 4),
+        expansion_nodes_per_frontier=int(payload.get("expansion_nodes_per_frontier") or 3),
+        expansion_total_node_limit=int(payload.get("expansion_total_node_limit") or 10),
+        expansion_queries_per_node=int(payload.get("expansion_queries_per_node") or 2),
+        expansion_search_results=int(payload.get("expansion_search_results") or 4),
+    )
+    try:
+        update_job(job_id, status="running", message=f"Building dossier using {profiles_csv}...", log=f"Building dossier for {person}.")
+        research_person_and_network.build_dossier(args, person, context, dossier_path)
+        update_job(job_id, files={"dossier": dossier_path}, dossier=read_file(dossier_path), log=f"Saved dossier: {dossier_path}")
+        update_job(job_id, message="Checking graph/network matches...", log=f"Checking network matches in {profiles_csv}.")
+        research_person_and_network.build_network_matches(args, dossier_path, matches_path)
+        routes = route_payload(dossier_path, profiles_csv, args.extra_term, args.min_score, args.match_limit)
+        update_job(job_id, status="done", message="Complete.", files={"dossier": dossier_path, "matches": matches_path}, dossier=read_file(dossier_path), matches=read_file(matches_path), routes=routes, log=f"Saved network matches: {matches_path}")
+    except Exception as error:
+        update_job(job_id, status="error", message=str(error), log=traceback.format_exc(), dossier=read_file(dossier_path), matches=read_file(matches_path), files={"dossier": dossier_path, "matches": matches_path})
+
+
+class ResearchHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def send_json(self, data, status=200):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_text(self, text, content_type="text/html; charset=utf-8", status=200):
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/":
+            self.send_static("index.html")
+            return
+        if parsed.path.startswith("/static/"):
+            self.send_static(parsed.path.replace("/static/", "", 1))
+            return
+        if parsed.path == "/api/network":
+            self.send_json(graph_summary())
+            return
+        if parsed.path.startswith("/api/jobs/"):
+            job_id = parsed.path.rsplit("/", 1)[-1]
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+            self.send_json(job or {"error": "Job not found."}, status=200 if job else 404)
+            return
+        if parsed.path == "/download":
+            requested = parse_qs(parsed.query).get("path", [""])[0]
+            normalized = os.path.abspath(os.path.normpath(requested))
+            output_root = os.path.abspath(OUTPUT_DIR)
+            if not normalized.startswith(output_root + os.sep) or not os.path.exists(normalized):
+                self.send_text("Not found.", content_type="text/plain; charset=utf-8", status=404)
+                return
+            self.send_text(read_file(normalized), content_type="text/markdown; charset=utf-8")
+            return
+        self.send_text("Not found.", content_type="text/plain; charset=utf-8", status=404)
+
+    def send_static(self, relative_path):
+        body = read_static_file(relative_path)
+        if body is None:
+            self.send_text("Not found.", content_type="text/plain; charset=utf-8", status=404)
+            return
+        ext = os.path.splitext(relative_path)[1]
+        self.send_text(body, content_type=CONTENT_TYPES.get(ext, "text/plain; charset=utf-8"))
+
+    def do_POST(self):
+        try:
+            if self.path == "/api/research":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                self.send_json({"job_id": make_job(payload)})
+                return
+            if self.path == "/api/network/reset":
+                save_graph(empty_graph())
+                self.send_json(graph_summary())
+                return
+            if self.path == "/api/network/manual":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                graph = load_graph()
+                parent_id = payload.get("parent_id") or "me"
+                if parent_id not in graph["nodes"]:
+                    raise ValueError("Selected parent is not in graph.")
+                parent_depth = int(graph["nodes"][parent_id].get("depth", 0) or 0)
+                node = add_node(graph, payload, source="manual", depth=parent_depth + 1)
+                add_edge(graph, parent_id, node["id"], source="manual")
+                save_graph(graph)
+                self.send_json({"node": node, **graph_summary()})
+                return
+            if self.path == "/api/network/upload":
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["file"] if "file" in form else None
+                if file_item is None or not getattr(file_item, "file", None):
+                    raise ValueError("CSV file is required.")
+                parent_id = form.getfirst("parent_id", "me")
+                replace_root = form.getfirst("replace_root", "0") == "1"
+                filename = os.path.basename(getattr(file_item, "filename", "") or "upload.csv")
+                result = import_connections(file_item.file.read(), parent_id=parent_id, filename=filename, replace_root=replace_root)
+                self.send_json(result)
+                return
+            self.send_json({"error": "Not found."}, status=404)
+        except Exception as error:
+            self.send_json({"error": str(error)}, status=400)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run the local ARTEMIS web app.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    if not os.path.exists(NETWORK_GRAPH_PATH):
+        save_graph(empty_graph())
+    server = ThreadingHTTPServer((args.host, args.port), ResearchHandler)
+    print(f"ARTEMIS: http://{args.host}:{args.port}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

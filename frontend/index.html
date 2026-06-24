@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ARTEMIS</title>
+  <link rel="stylesheet" href="/static/styles.css">
+
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><strong>ARTEMIS <span>Paths</span></strong><small>Warm-intro router</small></div>
+    <nav class="nav">
+      <button class="nav-btn active" data-view="searchView">Path Search</button>
+      <button class="nav-btn" data-view="buildView">Build Network</button>
+      <button class="nav-btn" data-view="graphView">Graph</button>
+    </nav>
+    <div class="status-pill"><span id="statusDot" class="dot"></span><span id="statusText">Idle</span></div>
+  </header>
+
+  <main class="page">
+    <section id="searchView" class="view active">
+      <div class="layout">
+        <section class="panel control">
+          <h1>Find a path to a target.</h1>
+          <p>Researches the target, builds an endpoint-side map, then scans your uploaded network graph for bridge candidates.</p>
+          <form id="researchForm">
+            <label>Target person</label><input id="person" placeholder="Fred Volinsky" required>
+            <label>Context</label><input id="context" placeholder="Company, school, firm, city">
+            <div class="row"><div><label>Results</label><input id="maxResults" type="number" min="1" max="20" value="5"></div><div><label>Pages</label><input id="maxPages" type="number" min="1" max="30" value="5"></div></div>
+            <div class="row"><div><label>Adjacent</label><input id="adjacent" type="number" min="0" max="60" value="8"></div><div><label>Matches</label><input id="matchLimit" type="number" min="1" max="200" value="50"></div></div>
+            <label>Search provider</label><select id="searchProvider"><option value="brave">Brave API</option><option value="apify">Apify Google SERP</option><option value="all">Fallback chain</option><option value="bing">Bing HTML</option><option value="google">Google HTML</option><option value="duckduckgo">DuckDuckGo HTML</option></select>
+            <label class="toggle"><input id="useApifyInstagram" type="checkbox"> Add public Instagram evidence through Apify</label>
+            <label class="toggle"><input id="allowInsecureSsl" type="checkbox" checked> Allow local self-signed SSL chain</label>
+            <label class="toggle"><input id="skipAdjacent" type="checkbox"> Skip adjacent-person expansion</label>
+            <label class="toggle"><input id="skipInstitution" type="checkbox"> Skip target-created institution search</label>
+            <label class="toggle"><input id="verifyHops" type="checkbox" checked> Verify hops with exact bridging search</label>
+            <label class="toggle"><input id="seedMap" type="checkbox" checked> Build seed-side relationship maps</label>
+            <div class="actions"><button id="runButton" class="primary" type="submit">Run Path Search</button><button class="secondary" type="button" id="clearButton">Clear</button></div>
+          </form>
+          <div id="jobMeta" class="markdown"><p>Uses <code>user_network_profiles.csv</code> after you upload a network. Falls back to <code>linkedin_network_profiles.csv</code>.</p></div>
+        </section>
+        <section class="panel">
+          <div class="tabs"><button class="tab active" data-tab="routesPane">Routes</button><button class="tab" data-tab="dossierPane">Dossier</button><button class="tab" data-tab="matchesPane">Report</button><button class="tab" data-tab="logPane">Log</button></div>
+          <div class="content">
+            <div id="fileLinks" class="file-links"></div>
+            <div id="routesPane"></div>
+            <div id="dossierPane" class="markdown" hidden></div>
+            <div id="matchesPane" class="markdown" hidden></div>
+            <pre id="logPane" class="log" hidden></pre>
+            <div id="emptyState" class="empty"><div><strong>No search yet</strong>Upload your network or run against the default CSV.</div></div>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section id="buildView" class="view">
+      <div class="layout">
+        <section class="panel control">
+          <h1>Build your network graph.</h1>
+          <p>Upload your LinkedIn export, click a connection, then manually add their connections or upload their CSV.</p>
+          <form id="uploadForm">
+            <label>Upload mode</label><select id="uploadMode"><option value="root">Replace with my LinkedIn CSV</option><option value="selected">Add CSV under selected connection</option></select>
+            <label>CSV file</label><input id="csvFile" type="file" accept=".csv,text/csv" required>
+            <div class="actions"><button class="primary" type="submit">Upload CSV</button></div>
+          </form>
+          <form id="manualForm">
+            <label>Add manual connection under selected person</label>
+            <input id="manualName" placeholder="Name" required>
+            <input id="manualCompany" placeholder="Company">
+            <input id="manualPosition" placeholder="Position">
+            <input id="manualUrl" placeholder="LinkedIn URL">
+            <div class="actions"><button class="primary" type="submit">Add Connection</button><button id="resetGraph" class="danger" type="button">Reset Graph</button></div>
+          </form>
+        </section>
+        <section class="panel"><div class="content"><div id="networkStats" class="stat-grid"></div><div class="row"><div><h3>Connections</h3><div id="connectionList" class="list"></div></div><div><h3>Selected</h3><div id="selectedCard" class="markdown"><p>Select a person to add their connections.</p></div></div></div></div></section>
+      </div>
+    </section>
+
+    <section id="graphView" class="view">
+      <section class="panel"><div class="content"><div id="fullGraph"></div></div></section>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+
+</body>
+</html>
