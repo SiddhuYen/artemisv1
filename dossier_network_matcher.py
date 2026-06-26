@@ -106,6 +106,34 @@ GENERIC_CLUE_TERMS = {
     "vice president",
 }
 
+
+
+COLD_APPROACH_RELATIONSHIP_WEIGHTS = {
+    "cofounder": 100,
+    "co founder": 100,
+    "founder": 96,
+    "chief of staff": 94,
+    "board": 92,
+    "investor": 90,
+    "advisor": 88,
+    "executive": 84,
+    "ceo": 84,
+    "coo": 84,
+    "cto": 84,
+    "president": 82,
+    "partner": 78,
+    "collaborator": 74,
+    "coworker": 72,
+    "operator": 70,
+    "podcast": 66,
+    "interview": 64,
+    "author": 58,
+    "journalist": 45,
+}
+
+PUBLIC_CONTACT_HINTS = ("linkedin", "twitter", "x.com", "substack", "medium", "github", "personal", "website", "email")
+
+
 GENERIC_TITLE_WORDS = {
     "advisor",
     "analyst",
@@ -1062,6 +1090,118 @@ def node_relationship_label(node):
     return node.get("relationship_to_target") or node.get("relationship_to_closest_person") or "documented relationship"
 
 
+
+def relationship_weight_for_cold_approach(node):
+    text = normalize(
+        " ".join(
+            [
+                node.get("relationship_to_target", ""),
+                node.get("relationship_to_closest_person", ""),
+                node.get("title", ""),
+                node.get("organization", ""),
+                node.get("proof", ""),
+            ]
+        )
+    )
+    best = 40
+    for keyword, weight in COLD_APPROACH_RELATIONSHIP_WEIGHTS.items():
+        if keyword in text:
+            best = max(best, weight)
+    strength = normalize(node.get("strength", ""))
+    if "strong" in strength or "direct" in strength:
+        best += 8
+    elif "medium" in strength:
+        best += 4
+    elif "weak" in strength:
+        best -= 8
+    return max(0, min(100, best))
+
+
+def accessibility_score_for_cold_approach(node):
+    score = 40
+    source_blob = normalize(" ".join([node.get("source_url", ""), node.get("source_title", ""), node.get("proof", "")]))
+    if any(hint in source_blob for hint in PUBLIC_CONTACT_HINTS):
+        score += 18
+    if node.get("source_url"):
+        score += 10
+    proof = normalize(node.get("proof", ""))
+    if any(term in proof for term in ("podcast", "interview", "newsletter", "speaker", "conference", "author", "blog")):
+        score += 20
+    if any(term in proof for term in ("board", "investor", "advisor", "executive")):
+        score -= 5
+    return max(0, min(100, score))
+
+
+def target_proximity_score_for_cold_approach(node):
+    if node.get("node_type") == "closest":
+        base = 92
+    elif node.get("node_type") == "expanded":
+        base = 62
+    else:
+        base = 74
+    relationship = normalize(node_relationship_label(node))
+    if any(term in relationship for term in ("cofounder", "founder", "board", "investor", "advisor", "executive")):
+        base += 8
+    return max(0, min(100, base))
+
+
+def cold_approach_candidate_payload(node, artemis_map, rank=None):
+    relationship_strength = relationship_weight_for_cold_approach(node)
+    accessibility = accessibility_score_for_cold_approach(node)
+    proximity = target_proximity_score_for_cold_approach(node)
+    responsiveness = accessibility
+    intro_probability = round((relationship_strength * 0.45) + (proximity * 0.40) + (accessibility * 0.15))
+    reply_probability = round((accessibility * 0.55) + (relationship_strength * 0.20) + (proximity * 0.25))
+    warmth_score = round((relationship_strength * 0.40) + (accessibility * 0.25) + (responsiveness * 0.15) + (proximity * 0.20))
+    target_chain = target_chain_for_node(node, artemis_map)
+    relationship = node_relationship_label(node)
+    name = node.get("name", "")
+    target = artemis_map.get("target", "the target")
+    reason = (
+        f"{name} is close to {target} as {relationship}. "
+        f"Use them when a warm network path is unavailable."
+    )
+    return {
+        "rank": rank,
+        "name": name,
+        "title": node.get("title", ""),
+        "company": node.get("organization", ""),
+        "relationship_to_target": relationship,
+        "node_type": node.get("node_type", ""),
+        "source_url": node.get("source_url", ""),
+        "proof": node.get("proof", ""),
+        "target_chain": target_chain,
+        "warmth_score": warmth_score,
+        "reply_probability": max(0, min(100, reply_probability)),
+        "intro_probability": max(0, min(100, intro_probability)),
+        "relationship_strength": relationship_strength,
+        "accessibility": accessibility,
+        "target_proximity": proximity,
+        "outreach_reason": reason,
+        "first_ask": (
+            f"Cold approach {name} with a narrow, evidence-based ask: mention the public reason they are connected "
+            f"to {target}, ask one concise question, and only request an intro after they engage."
+        ),
+    }
+
+
+def best_cold_approach_candidates(artemis_map, limit=10):
+    candidates = []
+    seen = set()
+    for node in artemis_nodes(artemis_map):
+        name = node.get("name", "")
+        if not name:
+            continue
+        key = normalize(" ".join([name, node.get("organization", ""), node_relationship_label(node)]))
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(cold_approach_candidate_payload(node, artemis_map))
+    candidates.sort(key=lambda item: (item["warmth_score"], item["intro_probability"], item["reply_probability"]), reverse=True)
+    for index, candidate in enumerate(candidates[:limit], 1):
+        candidate["rank"] = index
+    return candidates[:limit]
+
 def near_miss_path_items(bridge_matches, clue_matches, artemis_map, rejected_candidates=None, limit=5):
     rejected_candidates = rejected_candidates or []
     items = []
@@ -1283,6 +1423,29 @@ def write_artemis_report(
                     f"  - Ask {profile_payload(row)['name']} if they personally know or can validate the link to "
                     f"{target_node.get('name', 'this target-side clue')} before using the downstream path."
                 )
+
+        cold_candidates = best_cold_approach_candidates(artemis_map, limit=min(limit, 10))
+        lines.extend(["", "## Best Cold Approaches When No Path Exists"])
+        if not cold_candidates:
+            lines.append("No cold-approach candidates were available from the target-side map.")
+        else:
+            lines.append(
+                "These are target-side people to approach directly when no verified or usable warm path exists. "
+                "They are ranked by relationship strength, likely accessibility, and proximity to the target."
+            )
+            for index, candidate in enumerate(cold_candidates, 1):
+                lines.append(f"\n### {index}. {candidate['name']}")
+                lines.append(f"- Company / org: {candidate.get('company', '')}")
+                lines.append(f"- Relationship to target: {candidate.get('relationship_to_target', '')}")
+                lines.append(f"- Warmth score: {candidate['warmth_score']}/100")
+                lines.append(f"- Likely reply score: {candidate['reply_probability']}/100")
+                lines.append(f"- Likely intro score: {candidate['intro_probability']}/100")
+                lines.append(f"- Why: {candidate['outreach_reason']}")
+                if candidate.get("proof"):
+                    lines.append(f"- Evidence: {candidate.get('proof', '')}")
+                if candidate.get("source_url"):
+                    lines.append(f"- Source: {candidate.get('source_url', '')}")
+                lines.append(f"- First ask: {candidate['first_ask']}")
 
     lines.extend(["", "## Rejected Candidates"])
     if verification_enabled and not rejected_candidates:

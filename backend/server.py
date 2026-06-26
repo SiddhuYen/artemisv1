@@ -363,6 +363,10 @@ def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit):
                     "iffy_hop": f"{profile_payload(row)['name']} -> {target_node.get('name', 'target-side clue')}",
                 }
             )
+    cold_approaches = []
+    if not routes and artemis_map.get("closest_people"):
+        cold_approaches = dossier_network_matcher.best_cold_approach_candidates(artemis_map, limit=min(limit, 10))
+
     gateways = [gateway_payload(match, index) for index, match in enumerate(clue_matches[: min(limit, 12)], 1)]
     ecosystem_terms = dossier_network_matcher.unique(
         bridge_terms[:20]
@@ -373,7 +377,13 @@ def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit):
             if isinstance(item, dict)
         ][:20]
     )
-    return {"terms": terms, "routes": routes, "gateways": gateways, "ecosystem_terms": ecosystem_terms}
+    return {
+        "terms": terms,
+        "routes": routes,
+        "gateways": gateways,
+        "cold_approaches": cold_approaches,
+        "ecosystem_terms": ecosystem_terms,
+    }
 
 
 def board_node_id(person, index):
@@ -385,6 +395,7 @@ def board_node_id(person, index):
 def board_from_routes(job_id, person, context, routes_payload):
     routes = (routes_payload or {}).get("routes", [])[:8]
     gateways = (routes_payload or {}).get("gateways", [])[:8]
+    cold_approaches = (routes_payload or {}).get("cold_approaches", [])[:8]
     ecosystem_terms = (routes_payload or {}).get("ecosystem_terms", [])[:20]
     has_working_path = any(route.get("type") not in {"near_miss"} for route in routes)
     nodes = {}
@@ -493,6 +504,42 @@ def board_from_routes(job_id, person, context, routes_payload):
             }
         )
 
+    for cold_index, candidate in enumerate(cold_approaches):
+        node = {
+            "name": candidate.get("name", ""),
+            "company": candidate.get("company", ""),
+            "position": candidate.get("relationship_to_target", ""),
+            "profile_url": candidate.get("source_url", ""),
+        }
+        node_id = board_node_id(node, len(nodes) + cold_index + 1)
+        nodes[node_id] = {
+            "id": node_id,
+            "name": node["name"],
+            "company": node["company"],
+            "position": node["position"],
+            "profile_url": node["profile_url"],
+            "depth": 1,
+            "role": "cold_approach",
+            "source": "cold_approach",
+            "highlighted": False,
+            "route_count": 0,
+        }
+        leads.append(
+            {
+                "rank": len(leads) + 1,
+                "name": candidate.get("name", ""),
+                "company": candidate.get("company", ""),
+                "position": candidate.get("relationship_to_target", ""),
+                "profile_url": candidate.get("source_url", ""),
+                "score": candidate.get("warmth_score", ""),
+                "type": "cold_approach",
+                "confidence": "cold approach lead",
+                "ask": candidate.get("first_ask", "Cold approach with a narrow, evidence-based ask."),
+                "explanation": candidate.get("outreach_reason", ""),
+                "creation_strategy": f"Reply score {candidate.get('reply_probability', '')}/100; intro score {candidate.get('intro_probability', '')}/100.",
+            }
+        )
+
     board = {
         "id": job_id,
         "target": person,
@@ -501,6 +548,7 @@ def board_from_routes(job_id, person, context, routes_payload):
             "working_paths": sum(1 for route in routes if route.get("type") != "near_miss"),
             "near_misses": sum(1 for route in routes if route.get("type") == "near_miss"),
             "gateways": len(gateways),
+            "cold_approaches": len(cold_approaches),
             "leads": len(leads),
         },
         "ecosystem_terms": ecosystem_terms,
