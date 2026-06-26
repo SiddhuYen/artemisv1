@@ -50,14 +50,20 @@ function boardNodeId(person, index) {
 function boardPositions(nodes, width, height) {
   const byDepth = {};
   nodes.forEach(node => {
-    const depth = Number(node.depth || (node.role === 'target' ? 5 : 1));
+    let depth = Number(node.depth || 1);
+    if (node.role === 'me' || node.id === 'me') depth = 0;
+    if (node.role === 'target') depth = 5;
+    if (node.role === 'sub_target') depth = Math.max(3, Math.min(depth, 4));
+    if (node.role === 'cold_approach') depth = Math.max(2, Math.min(depth, 4));
+    if (node.role === 'gateway' || node.role === 'ecosystem') depth = Math.max(2, Math.min(depth, 4));
+    node._layoutDepth = depth;
     (byDepth[depth] ||= []).push(node);
   });
   const depths = Object.keys(byDepth).map(Number).sort((a, b) => a - b);
   const pos = new Map();
   depths.forEach((depth, depthIndex) => {
     const group = byDepth[depth];
-    const x = 70 + (depthIndex / Math.max(depths.length - 1, 1)) * (width - 190);
+    const x = 70 + (depth / 5) * (width - 190);
     group.forEach((node, index) => {
       const y = 70 + ((index + 1) / (group.length + 1)) * (height - 160);
       pos.set(node.id, {x, y});
@@ -72,6 +78,19 @@ function normalizeBoard(board) {
   board.edges ||= [];
   if (!board.nodes.some(node => node.id === 'me')) {
     board.nodes.unshift({id: 'me', name: 'You', depth: 0, role: 'me', highlighted: true});
+  }
+  if (board.target && !board.nodes.some(node => node.role === 'target')) {
+    board.nodes.push({
+      id: boardNodeId({name: board.target}, 999),
+      name: board.target,
+      company: board.context || '',
+      position: 'Target',
+      depth: 5,
+      role: 'target',
+      source: 'target',
+      highlighted: true,
+      route_count: 0,
+    });
   }
   return board;
 }

@@ -107,6 +107,7 @@ button, input, select { font: inherit; }
 }
 .board-edge.active, .board-edge.candidate { stroke: #14b8a6; }
 .board-edge.near_miss, .board-edge.gateway { stroke: #f59e0b; stroke-dasharray: 7 7; }
+.board-edge.cold_approach { stroke: #38bdf8; stroke-width: 3; stroke-dasharray: 4 7; }
 .board-edge.manual { stroke: #a78bfa; }
 .board-node {
   position: absolute;

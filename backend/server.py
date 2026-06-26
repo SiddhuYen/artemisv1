@@ -401,6 +401,13 @@ def board_from_routes(job_id, person, context, routes_payload):
     nodes = {}
     edges = []
     leads = []
+    target_node = {
+        "name": person,
+        "company": context,
+        "position": "Target",
+        "profile_url": "",
+    }
+    target_id = board_node_id(target_node, 999)
 
     for route_index, route in enumerate(routes):
         path = route.get("path", [])
@@ -505,6 +512,19 @@ def board_from_routes(job_id, person, context, routes_payload):
         )
 
     for cold_index, candidate in enumerate(cold_approaches):
+        if target_id not in nodes:
+            nodes[target_id] = {
+                "id": target_id,
+                "name": person,
+                "company": context,
+                "position": "Target",
+                "profile_url": "",
+                "depth": 4,
+                "role": "target",
+                "source": "target",
+                "highlighted": True,
+                "route_count": 0,
+            }
         node = {
             "name": candidate.get("name", ""),
             "company": candidate.get("company", ""),
@@ -512,18 +532,29 @@ def board_from_routes(job_id, person, context, routes_payload):
             "profile_url": candidate.get("source_url", ""),
         }
         node_id = board_node_id(node, len(nodes) + cold_index + 1)
+        cold_depth = 2 + (cold_index % 2)
         nodes[node_id] = {
             "id": node_id,
             "name": node["name"],
             "company": node["company"],
             "position": node["position"],
             "profile_url": node["profile_url"],
-            "depth": 1,
+            "depth": cold_depth,
             "role": "cold_approach",
             "source": "cold_approach",
             "highlighted": False,
             "route_count": 0,
         }
+        edges.append(
+            {
+                "key": f"{node_id}->{target_id}:cold-{cold_index}",
+                "source": node_id,
+                "target": target_id,
+                "route": f"cold-{cold_index}",
+                "type": "cold_approach",
+                "highlighted": False,
+            }
+        )
         leads.append(
             {
                 "rank": len(leads) + 1,
