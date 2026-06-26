@@ -465,6 +465,40 @@ def board_from_routes(job_id, person, context, routes_payload):
     }
     target_id = board_node_id(target_node, 999)
 
+    def hop_reason(route_item, previous_person, current_person, depth, path):
+        previous_name = previous_person.get("name", "Unknown")
+        current_name = current_person.get("name", "Unknown")
+        profile_name = (route_item.get("profile") or {}).get("name", "")
+        route_reason = route_item.get("link_reason") or route_item.get("explanation", "")
+        is_bridge_hop = profile_name and previous_name == profile_name and depth < len(path)
+        is_final_target_hop = depth == len(path) - 1
+        if is_bridge_hop:
+            return {
+                "reason": route_reason or f"{previous_name} is the local-side bridge into {current_name}.",
+                "evidence": route_item.get("evidence", ""),
+                "source_url": route_item.get("source_url", ""),
+                "target_source_url": route_item.get("target_source_url", ""),
+                "relationship_type": route_item.get("relationship_type", ""),
+                "confidence": route_item.get("confidence", ""),
+            }
+        if is_final_target_hop and route_item.get("target_proof"):
+            return {
+                "reason": f"{current_name} is the target endpoint. {route_item.get('target_proof', '')}",
+                "evidence": route_item.get("target_proof", ""),
+                "source_url": route_item.get("target_source_url", ""),
+                "target_source_url": route_item.get("target_source_url", ""),
+                "relationship_type": "target-side relationship",
+                "confidence": route_item.get("confidence", ""),
+            }
+        return {
+            "reason": f"Saved network path: {previous_name} is connected to {current_name} in your local graph.",
+            "evidence": "",
+            "source_url": previous_person.get("profile_url", ""),
+            "target_source_url": current_person.get("profile_url", ""),
+            "relationship_type": "local network edge",
+            "confidence": "known local graph connection",
+        }
+
     for route_index, route in enumerate(routes):
         path = route.get("path", [])
         route_type = route.get("type") or "candidate"
@@ -487,6 +521,7 @@ def board_from_routes(job_id, person, context, routes_payload):
                 "route_count": int(existing.get("route_count", 0)) + 1,
             }
             if depth > 0:
+                hop = hop_reason(route, path[depth - 1], person_item, depth, path)
                 source = board_node_id(path[depth - 1], depth - 1)
                 edge_key_value = f"{source}->{node_id}:{route_index}"
                 edges.append(
@@ -497,12 +532,7 @@ def board_from_routes(job_id, person, context, routes_payload):
                         "route": route_index,
                         "type": route_type,
                         "highlighted": highlighted,
-                        "reason": link_reason,
-                        "evidence": route.get("evidence", ""),
-                        "source_url": route.get("source_url", ""),
-                        "target_source_url": route.get("target_source_url", ""),
-                        "relationship_type": route.get("relationship_type", ""),
-                        "confidence": route.get("confidence", ""),
+                        **hop,
                     }
                 )
         if path:
@@ -547,6 +577,28 @@ def board_from_routes(job_id, person, context, routes_payload):
                 "route_count": int(existing.get("route_count", 0)) + 1,
             }
             if depth > 0:
+                previous_person = path[depth - 1]
+                is_gateway_bridge = depth == len(path) - 2
+                is_gateway_target = depth == len(path) - 1
+                if is_gateway_bridge or is_gateway_target:
+                    hop = {
+                        "reason": link_reason or f"{previous_person.get('name', 'This node')} points toward {person_item.get('name', 'the target ecosystem')}.",
+                        "evidence": gateway.get("evidence", ""),
+                        "source_url": gateway.get("source_url", ""),
+                        "target_source_url": person_item.get("profile_url", ""),
+                        "confidence": gateway.get("confidence", ""),
+                    }
+                else:
+                    hop = {
+                        "reason": (
+                            f"Saved network path: {previous_person.get('name', 'Unknown')} is connected to "
+                            f"{person_item.get('name', 'Unknown')} in your local graph."
+                        ),
+                        "evidence": "",
+                        "source_url": previous_person.get("profile_url", ""),
+                        "target_source_url": person_item.get("profile_url", ""),
+                        "confidence": "known local graph connection",
+                    }
                 source = board_node_id(path[depth - 1], depth - 1)
                 edges.append(
                     {
@@ -556,10 +608,7 @@ def board_from_routes(job_id, person, context, routes_payload):
                         "route": route_index,
                         "type": "gateway",
                         "highlighted": False,
-                        "reason": link_reason,
-                        "evidence": gateway.get("evidence", ""),
-                        "source_url": gateway.get("source_url", ""),
-                        "confidence": gateway.get("confidence", ""),
+                        **hop,
                     }
                 )
         lead_person = gateway.get("profile") or (path[1] if len(path) > 1 else {})
