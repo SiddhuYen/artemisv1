@@ -392,6 +392,19 @@ def board_node_id(person, index):
     return key or f"node-{index}"
 
 
+def board_person_key(person):
+    url = normalize_url(person.get("profile_url", ""))
+    if url:
+        return f"url:{url.lower()}"
+    name = dossier_network_matcher.normalize(person.get("name", ""))
+    company = dossier_network_matcher.normalize(person.get("company", ""))
+    if name and company:
+        return f"name_company:{name}:{company}"
+    if name:
+        return f"name:{name}"
+    return ""
+
+
 def board_from_routes(job_id, person, context, routes_payload):
     routes = (routes_payload or {}).get("routes", [])[:8]
     gateways = (routes_payload or {}).get("gateways", [])[:8]
@@ -686,8 +699,17 @@ def merge_boards(base, incoming, run_person, run_context, dossier_path="", match
     base.setdefault("edges", [])
     base.setdefault("leads", [])
     existing_nodes = {node.get("id"): node for node in base["nodes"]}
+    canonical_nodes = {}
+    for node in base["nodes"]:
+        for key in (
+            board_person_key(node),
+            f"name:{dossier_network_matcher.normalize(node.get('name', ''))}",
+        ):
+            if key and key not in canonical_nodes:
+                canonical_nodes[key] = node
     edge_keys = {edge.get("key") for edge in base["edges"]}
     run_prefix = f"run-{incoming.get('id', int(time.time() * 1000))}"
+    id_map = {}
 
     if not base.get("target"):
         base["target"] = incoming.get("target", run_person)
@@ -699,19 +721,33 @@ def merge_boards(base, incoming, run_person, run_context, dossier_path="", match
         node["last_run_person"] = run_person
         node["dossier_path"] = dossier_path
         node["matches_path"] = matches_path
-        if node.get("role") == "target" and normalize_url(node.get("name")) != normalize_url(base.get("target")):
+        node_name_key = f"name:{dossier_network_matcher.normalize(node.get('name', ''))}"
+        existing = existing_nodes.get(node.get("id")) or canonical_nodes.get(board_person_key(node)) or canonical_nodes.get(node_name_key)
+        if node.get("role") == "target" and dossier_network_matcher.normalize(node.get("name")) != dossier_network_matcher.normalize(base.get("target")):
             node["role"] = "sub_target"
-        existing = existing_nodes.get(node.get("id"))
         if existing:
+            id_map[node.get("id")] = existing.get("id")
+            if existing.get("role") in {"cold_approach", "lead", "gateway", "ecosystem"} and node.get("role") in {"target", "sub_target"}:
+                node["role"] = existing.get("role")
+                node["depth"] = existing.get("depth", node.get("depth"))
             existing.update({key: value for key, value in node.items() if value not in ("", None, [])})
+            existing["id"] = id_map[node.get("id")]
             existing["route_count"] = int(existing.get("route_count", 0) or 0) + int(node.get("route_count", 0) or 0)
             existing["highlighted"] = bool(existing.get("highlighted") or node.get("highlighted"))
         else:
+            id_map[node.get("id")] = node.get("id")
             base["nodes"].append(node)
             existing_nodes[node.get("id")] = node
+            for key in (board_person_key(node), node_name_key):
+                if key and key not in canonical_nodes:
+                    canonical_nodes[key] = node
 
     for edge in incoming.get("edges", []):
         edge = dict(edge)
+        edge["source"] = id_map.get(edge.get("source"), edge.get("source"))
+        edge["target"] = id_map.get(edge.get("target"), edge.get("target"))
+        if edge.get("source") == edge.get("target"):
+            continue
         edge["route"] = f"{run_prefix}:{edge.get('route', '')}"
         edge["key"] = f"{edge.get('source')}->{edge.get('target')}:{edge.get('route')}"
         if edge["key"] in edge_keys:

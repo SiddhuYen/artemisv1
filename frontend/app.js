@@ -47,6 +47,47 @@ function boardNodeId(person, index) {
   return raw.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `node-${index}`;
 }
 
+function normalizeName(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function nodeCanonicalKey(node) {
+  const url = String(node?.profile_url || '').trim().split('?', 1)[0].replace(/\/$/, '').toLowerCase();
+  if (url) return `url:${url}`;
+  const name = normalizeName(node?.name);
+  const company = normalizeName(node?.company);
+  if (name && company) return `name_company:${name}:${company}`;
+  return name ? `name:${name}` : '';
+}
+
+function collapseDuplicateBoardNodes(board) {
+  const canonical = new Map();
+  const idMap = new Map();
+  const nodes = [];
+  for (const node of board.nodes || []) {
+    const nameKey = normalizeName(node.name) ? `name:${normalizeName(node.name)}` : '';
+    const key = nodeCanonicalKey(node);
+    const existing = canonical.get(key) || canonical.get(nameKey);
+    if (existing && node.id !== 'me') {
+      idMap.set(node.id, existing.id);
+      existing.route_count = Number(existing.route_count || 0) + Number(node.route_count || 0);
+      existing.highlighted = Boolean(existing.highlighted || node.highlighted);
+      if (!existing.dossier_path && node.dossier_path) existing.dossier_path = node.dossier_path;
+      if (!existing.matches_path && node.matches_path) existing.matches_path = node.matches_path;
+      continue;
+    }
+    nodes.push(node);
+    if (key) canonical.set(key, node);
+    if (nameKey) canonical.set(nameKey, node);
+  }
+  board.nodes = nodes;
+  board.edges = (board.edges || []).map(edge => ({
+    ...edge,
+    source: idMap.get(edge.source) || edge.source,
+    target: idMap.get(edge.target) || edge.target,
+  })).filter(edge => edge.source !== edge.target);
+}
+
 function boardPositions(nodes, width, height) {
   const byDepth = {};
   nodes.forEach(node => {
@@ -92,6 +133,7 @@ function normalizeBoard(board) {
       route_count: 0,
     });
   }
+  collapseDuplicateBoardNodes(board);
   return board;
 }
 
