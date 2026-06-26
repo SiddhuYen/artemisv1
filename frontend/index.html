@@ -62,6 +62,10 @@
           </div>
           <div class="actions"><button id="runButton" class="primary" type="submit">Run</button></div>
         </form>
+        <div id="runProgress" class="run-progress" hidden>
+          <div class="progress-meta"><strong id="progressTitle">Running</strong><span id="progressDetail">Starting workflow...</span></div>
+          <div class="progress-track"><span></span></div>
+        </div>
         <div id="runHint" class="hint">Click a cold-start or lead node to run toward it while preserving the original target.</div>
       </aside>
 

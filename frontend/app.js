@@ -11,6 +11,13 @@ function setStatus(status, label) {
   $('statusDot').className = `dot ${status || ''}`;
   $('statusText').textContent = label;
   $('runButton').disabled = status === 'running';
+  const progress = $('runProgress');
+  if (progress) progress.hidden = status !== 'running';
+  if ($('progressTitle')) $('progressTitle').textContent = status === 'running' ? label : status === 'error' ? 'Error' : status === 'done' ? 'Complete' : 'Idle';
+}
+
+function setProgressDetail(detail) {
+  if ($('progressDetail')) $('progressDetail').textContent = detail || 'Working...';
 }
 
 function escapeHtml(v) {
@@ -243,6 +250,7 @@ function payloadForRun(person, context = '') {
 async function runResearch(person, context = '') {
   if (!currentBoard) await loadBoards();
   setStatus('running', 'Starting');
+  setProgressDetail(`Preparing research for ${person}.`);
   const res = await fetch('/api/research', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payloadForRun(person, context))});
   const data = await res.json();
   if (!res.ok) {
@@ -258,6 +266,7 @@ async function pollJob(id) {
   const res = await fetch(`/api/jobs/${id}`);
   const job = await res.json();
   setStatus(job.status === 'done' ? 'done' : job.status === 'error' ? 'error' : 'running', job.status === 'done' ? 'Complete' : job.status === 'error' ? 'Error' : 'Running');
+  setProgressDetail(job.message || (job.log || []).slice(-1)[0] || 'Working...');
   if (job.board) {
     currentBoard = normalizeBoard(job.board);
     await refreshBoardListOnly();
