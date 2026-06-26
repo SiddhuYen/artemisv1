@@ -560,6 +560,152 @@ def board_from_routes(job_id, person, context, routes_payload):
     return board
 
 
+def new_board(name="Untitled Board"):
+    board_id = f"{int(time.time() * 1000)}_{slugify(name)[:32]}"
+    board = {
+        "id": board_id,
+        "name": name or "Untitled Board",
+        "target": "",
+        "context": "",
+        "summary": {"working_paths": 0, "near_misses": 0, "gateways": 0, "cold_approaches": 0, "leads": 0},
+        "ecosystem_terms": [],
+        "nodes": [
+            {
+                "id": "me",
+                "name": "You",
+                "company": "",
+                "position": "",
+                "profile_url": "",
+                "depth": 0,
+                "role": "me",
+                "source": "root",
+                "highlighted": True,
+                "route_count": 0,
+            }
+        ],
+        "edges": [],
+        "leads": [],
+        "saved": False,
+        "updated_at": time.time(),
+    }
+    save_board(board)
+    return board
+
+
+def board_summary_item(board):
+    return {
+        "id": board.get("id", ""),
+        "name": board.get("name") or board.get("target") or "Untitled Board",
+        "target": board.get("target", ""),
+        "updated_at": board.get("updated_at", 0),
+        "nodes": len(board.get("nodes", [])),
+        "edges": len(board.get("edges", [])),
+        "saved": bool(board.get("saved")),
+    }
+
+
+def list_boards():
+    os.makedirs(BOARD_DIR, exist_ok=True)
+    boards = []
+    for filename in os.listdir(BOARD_DIR):
+        if not filename.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(BOARD_DIR, filename), "r", encoding="utf-8") as file:
+                board = json.load(file)
+                if not board.get("name"):
+                    continue
+                boards.append(board_summary_item(board))
+        except Exception:
+            continue
+    boards.sort(key=lambda item: item.get("updated_at", 0), reverse=True)
+    return boards
+
+
+def ensure_board(board_id=""):
+    if board_id:
+        try:
+            return load_board(board_id)
+        except ValueError:
+            pass
+    boards = list_boards()
+    if boards:
+        return load_board(boards[0]["id"])
+    return new_board("Untitled Board")
+
+
+def recompute_board_summary(board):
+    routes = {}
+    for edge in board.get("edges", []):
+        route_key = edge.get("route")
+        if route_key in {"manual", None, ""}:
+            continue
+        routes.setdefault(route_key, edge.get("type", "candidate"))
+    board["summary"] = {
+        "working_paths": sum(1 for value in routes.values() if value not in {"near_miss", "gateway", "manual"}),
+        "near_misses": sum(1 for value in routes.values() if value == "near_miss"),
+        "gateways": sum(1 for value in routes.values() if value == "gateway"),
+        "cold_approaches": sum(1 for node in board.get("nodes", []) if node.get("role") == "cold_approach"),
+        "leads": len(board.get("leads", [])),
+    }
+
+
+def merge_boards(base, incoming, run_person, run_context, dossier_path="", matches_path=""):
+    base.setdefault("nodes", [])
+    base.setdefault("edges", [])
+    base.setdefault("leads", [])
+    existing_nodes = {node.get("id"): node for node in base["nodes"]}
+    edge_keys = {edge.get("key") for edge in base["edges"]}
+    run_prefix = f"run-{incoming.get('id', int(time.time() * 1000))}"
+
+    if not base.get("target"):
+        base["target"] = incoming.get("target", run_person)
+        base["context"] = incoming.get("context", run_context)
+    base["name"] = base.get("name") or base.get("target") or "Untitled Board"
+
+    for node in incoming.get("nodes", []):
+        node = dict(node)
+        node["last_run_person"] = run_person
+        node["dossier_path"] = dossier_path
+        node["matches_path"] = matches_path
+        if node.get("role") == "target" and normalize_url(node.get("name")) != normalize_url(base.get("target")):
+            node["role"] = "sub_target"
+        existing = existing_nodes.get(node.get("id"))
+        if existing:
+            existing.update({key: value for key, value in node.items() if value not in ("", None, [])})
+            existing["route_count"] = int(existing.get("route_count", 0) or 0) + int(node.get("route_count", 0) or 0)
+            existing["highlighted"] = bool(existing.get("highlighted") or node.get("highlighted"))
+        else:
+            base["nodes"].append(node)
+            existing_nodes[node.get("id")] = node
+
+    for edge in incoming.get("edges", []):
+        edge = dict(edge)
+        edge["route"] = f"{run_prefix}:{edge.get('route', '')}"
+        edge["key"] = f"{edge.get('source')}->{edge.get('target')}:{edge.get('route')}"
+        if edge["key"] in edge_keys:
+            continue
+        edge_keys.add(edge["key"])
+        base["edges"].append(edge)
+
+    for lead in incoming.get("leads", []):
+        lead = dict(lead)
+        lead["run_person"] = run_person
+        lead["dossier_path"] = dossier_path
+        lead["matches_path"] = matches_path
+        lead["rank"] = len(base["leads"]) + 1
+        base["leads"].append(lead)
+
+    base["ecosystem_terms"] = dossier_network_matcher.unique(
+        list(base.get("ecosystem_terms", [])) + list(incoming.get("ecosystem_terms", []))
+    )[:40]
+    base["updated_at"] = time.time()
+    base["saved"] = False
+    recompute_board_summary(base)
+    save_board(base)
+    return base
+
+
 def board_path(board_id):
     safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(board_id or "")).strip("._")
     if not safe_id:
@@ -721,7 +867,10 @@ def read_file(path):
 def active_profiles_csv():
     if os.path.exists(NETWORK_CSV_PATH):
         return NETWORK_CSV_PATH
-    return FALLBACK_NETWORK_CSV_PATH
+    if os.path.exists(FALLBACK_NETWORK_CSV_PATH):
+        return FALLBACK_NETWORK_CSV_PATH
+    save_graph(load_graph())
+    return NETWORK_CSV_PATH
 
 
 def run_job(job_id, payload):
@@ -770,6 +919,7 @@ def run_job(job_id, payload):
         expansion_queries_per_node=int(payload.get("expansion_queries_per_node") or 2),
         expansion_search_results=int(payload.get("expansion_search_results") or 4),
     )
+    board_id = payload.get("board_id") or ""
     try:
         cache_note = "fresh refresh requested" if args.force_refresh else f"cache up to {args.cache_days} day(s)"
         update_job(job_id, status="running", message=f"Building dossier using {profiles_csv}...", log=f"Building dossier for {person} ({cache_note}).")
@@ -778,7 +928,10 @@ def run_job(job_id, payload):
         update_job(job_id, message="Checking graph/network matches...", log=f"Checking network matches in {profiles_csv}.")
         research_person_and_network.build_network_matches(args, dossier_path, matches_path)
         routes = route_payload(dossier_path, profiles_csv, args.extra_term, args.min_score, args.match_limit)
-        board = board_from_routes(job_id, person, context, routes)
+        generated_board = board_from_routes(job_id, person, context, routes)
+        board = generated_board
+        if board_id:
+            board = merge_boards(load_board(board_id), generated_board, person, context, dossier_path, matches_path)
         update_job(job_id, status="done", message="Complete.", files={"dossier": dossier_path, "matches": matches_path}, dossier=read_file(dossier_path), matches=read_file(matches_path), routes=routes, board=board, log=f"Saved network matches: {matches_path}")
     except Exception as error:
         update_job(job_id, status="error", message=str(error), log=traceback.format_exc(), dossier=read_file(dossier_path), matches=read_file(matches_path), files={"dossier": dossier_path, "matches": matches_path})
@@ -815,6 +968,10 @@ class ResearchHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/network":
             self.send_json(graph_summary())
             return
+        if parsed.path == "/api/boards":
+            board = ensure_board()
+            self.send_json({"boards": list_boards(), "current": board})
+            return
         if parsed.path.startswith("/api/jobs/"):
             job_id = parsed.path.rsplit("/", 1)[-1]
             with JOBS_LOCK:
@@ -837,6 +994,18 @@ class ResearchHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)
+            return
+        if parsed.path.startswith("/api/boards/") and parsed.path.endswith("/save"):
+            board_id = parsed.path.split("/")[-2]
+            try:
+                board = load_board(board_id)
+            except ValueError as error:
+                self.send_json({"error": str(error)}, status=404)
+                return
+            board["saved"] = True
+            board["updated_at"] = time.time()
+            save_board(board)
+            self.send_json(board)
             return
         if parsed.path.startswith("/api/boards/"):
             board_id = parsed.path.rsplit("/", 1)[-1]
@@ -870,6 +1039,29 @@ class ResearchHandler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 self.send_json({"job_id": make_job(payload)})
+                return
+            if self.path == "/api/boards":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                board = new_board((payload.get("name") or "Untitled Board").strip())
+                self.send_json(board)
+                return
+            if self.path.startswith("/api/boards/") and self.path.endswith("/save"):
+                board_id = self.path.split("/")[-2]
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                board = load_board(board_id)
+                if payload.get("name") is not None:
+                    board["name"] = (payload.get("name") or "Untitled Board").strip()
+                if payload.get("board"):
+                    incoming = payload["board"]
+                    for key in ("target", "context", "nodes", "edges", "leads", "ecosystem_terms", "summary"):
+                        if key in incoming:
+                            board[key] = incoming[key]
+                board["saved"] = True
+                board["updated_at"] = time.time()
+                save_board(board)
+                self.send_json(board)
                 return
             if self.path == "/api/network/reset":
                 save_graph(empty_graph())

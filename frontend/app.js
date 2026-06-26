@@ -1,69 +1,351 @@
 const $ = (id) => document.getElementById(id);
-    let currentNetwork = {nodes:[], edges:[], stats:{}};
-    let selectedNodeId = 'me';
-    let currentRoutes = [];
-    let currentBoard = null;
 
-    function setStatus(status, label){$('statusDot').className=`dot ${status||''}`;$('statusText').textContent=label;$('runButton').disabled=status==='running'}
-    function escapeHtml(v){return String(v||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-    function inlineMarkdown(v){let t=escapeHtml(v);t=t.replace(/`([^`]+)`/g,'<code>$1</code>');t=t.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank" rel="noreferrer">$1</a>');return t}
-    function renderMarkdown(md){const lines=String(md||'').split(/\r?\n/), out=[];let list=false;for(const line of lines){if(/^\s*[-*]\s+/.test(line)){if(!list){out.push('<ul>');list=true}out.push(`<li>${inlineMarkdown(line.replace(/^\s*[-*]\s+/,''))}</li>`);continue}if(list){out.push('</ul>');list=false}if(/^###\s+/.test(line))out.push(`<h3>${inlineMarkdown(line.replace(/^###\s+/,''))}</h3>`);else if(/^##\s+/.test(line))out.push(`<h2>${inlineMarkdown(line.replace(/^##\s+/,''))}</h2>`);else if(/^#\s+/.test(line))out.push(`<h1>${inlineMarkdown(line.replace(/^#\s+/,''))}</h1>`);else if(line.trim())out.push(`<p>${inlineMarkdown(line)}</p>`)}if(list)out.push('</ul>');return out.join('\\n')}
-    function personLabel(p){return [p?.name,p?.company,p?.position].filter(Boolean).join(' · ')||'Unknown'}
-    function initials(p){const parts=String(p?.name||'?').trim().split(/\s+/).filter(Boolean);return (parts.length>1?parts[0][0]+parts[parts.length-1][0]:parts[0].slice(0,2)).toUpperCase()}
+let currentNetwork = {nodes: [], edges: [], stats: {}};
+let selectedNodeId = 'me';
+let boards = [];
+let currentBoard = null;
+let selectedBoardNodeId = 'me';
+let pollTimer = null;
 
-    document.querySelectorAll('.nav-btn').forEach(btn=>btn.onclick=()=>{document.querySelectorAll('.nav-btn').forEach(b=>b.classList.toggle('active',b===btn));document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===btn.dataset.view));if(btn.dataset.view==='graphView')renderFullGraph()});
-    document.querySelectorAll('.tab').forEach(btn=>btn.onclick=()=>{document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b===btn));['boardPane','routesPane','dossierPane','matchesPane','logPane'].forEach(id=>$(id).hidden=id!==btn.dataset.tab)});
+function setStatus(status, label) {
+  $('statusDot').className = `dot ${status || ''}`;
+  $('statusText').textContent = label;
+  $('runButton').disabled = status === 'running';
+}
 
-    async function loadNetwork(){const res=await fetch('/api/network');currentNetwork=await res.json();renderNetworkPanel();renderFullGraph()}
-    function renderNetworkPanel(){const s=currentNetwork.stats||{};$('networkStats').innerHTML=[['Nodes',s.nodes||0],['Edges',s.edges||0],['First-degree',s.first_degree||0],['2nd+ degree',s.second_degree_plus||0]].map(([k,v])=>`<div class="stat"><strong>${v}</strong><span>${k}</span></div>`).join('');
-      const nodes=[...(currentNetwork.nodes||[])].sort((a,b)=>(a.depth||0)-(b.depth||0)||String(a.name).localeCompare(String(b.name)));
-      $('connectionList').innerHTML=nodes.map(n=>`<div class="person-card ${n.id===selectedNodeId?'active':''}" data-id="${escapeHtml(n.id)}"><strong>${escapeHtml(n.name)}</strong><span>${escapeHtml([n.company,n.position].filter(Boolean).join(' · '))}</span><span>${escapeHtml(n.profile_url||'')}</span></div>`).join('');
-      document.querySelectorAll('.person-card').forEach(card=>card.onclick=()=>{selectedNodeId=card.dataset.id;renderNetworkPanel()});
-      const selected=nodes.find(n=>n.id===selectedNodeId)||nodes[0]; if(selected){selectedNodeId=selected.id;$('selectedCard').innerHTML=`<h2>${escapeHtml(selected.name)}</h2><p>${escapeHtml([selected.company,selected.position].filter(Boolean).join(' · '))}</p><p><code>${escapeHtml(selected.profile_url||selected.id)}</code></p><p>Depth: ${escapeHtml(selected.depth)}</p>`}
-    }
+function escapeHtml(v) {
+  return String(v || '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
 
-    function graphPositions(nodes,width,height){const byDepth={};nodes.forEach(n=>{const d=Number(n.depth||0);(byDepth[d] ||= []).push(n)});const depths=Object.keys(byDepth).map(Number).sort((a,b)=>a-b);const pos=new Map();depths.forEach((d,di)=>{const group=byDepth[d];group.forEach((n,i)=>{const x=60+(di/(Math.max(depths.length-1,1)))*(width-140);const y=50+((i+1)/(group.length+1))*(height-120);pos.set(n.id,{x,y})})});return pos}
-    function renderGraph(containerId,nodes,edges,options={}){const width=1100,height=Math.max(560,nodes.length*18);const pos=graphPositions(nodes,width,height);const edgeSvg=edges.map(e=>{const a=pos.get(e.source),b=pos.get(e.target);if(!a||!b)return'';const mid=(a.x+b.x)/2;return `<path d="M ${a.x+29} ${a.y+29} C ${mid} ${a.y+29}, ${mid} ${b.y+29}, ${b.x} ${b.y+29}" fill="none" stroke="#cbd5e1" stroke-width="2"></path>`}).join('');
-      const nodeHtml=nodes.map(n=>{const p=pos.get(n.id);const cls=n.id==='me'?'me':options.targetId===n.id?'target':'';return `<div class="node ${cls}" style="left:${p.x}px;top:${p.y}px" title="${escapeHtml(personLabel(n))}">${escapeHtml(initials(n))}</div><div class="node-label" style="left:${p.x}px;top:${p.y+64}px">${escapeHtml(n.name)}${n.company?'<br>'+escapeHtml(n.company):''}</div>`}).join('');
-      $(containerId).innerHTML=`<div class="network-map"><div class="network-canvas" style="height:${height}px"><svg class="edge-layer" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${edgeSvg}</svg>${nodeHtml}</div></div>`;
-    }
-    function renderFullGraph(){renderGraph('fullGraph',currentNetwork.nodes||[],currentNetwork.edges||{})}
+function safeUrl(url) {
+  const value = String(url || '').trim();
+  if (!value) return '';
+  try {
+    const parsed = new URL(value, window.location.origin);
+    return ['http:', 'https:', '/api/boards/', '/download'].some(prefix => parsed.protocol === prefix || value.startsWith(prefix)) ? value : '';
+  } catch {
+    return value.startsWith('/download') || value.startsWith('/api/boards/') ? value : '';
+  }
+}
 
-    function routeNodeKey(p,index){if(index===0)return'route-me';const raw=(p?.profile_url||p?.name||`node-${index}`).toLowerCase();return raw.replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||`node-${index}`}
-    function routePositions(nodes,width,height){const byDepth={};nodes.forEach(n=>{(byDepth[n.depth] ||= []).push(n)});const depths=Object.keys(byDepth).map(Number).sort((a,b)=>a-b);const pos=new Map();depths.forEach((depth,di)=>{const group=byDepth[depth];const x=80+(di/(Math.max(depths.length-1,1)))*(width-180);group.forEach((n,i)=>{const spread=Math.min(420,Math.max(180,group.length*86));const top=(height-spread)/2;const y=top+((i+1)/(group.length+1))*spread;pos.set(n.id,{x,y})})});return pos}
-    function routePathD(a,b){const mid=(a.x+b.x)/2;return `M ${a.x+31} ${a.y+31} C ${mid} ${a.y-26}, ${mid} ${b.y+88}, ${b.x+31} ${b.y+31}`}
-    function selectRoute(index){document.querySelectorAll('[data-route]').forEach(el=>el.classList.toggle('active',Number(el.dataset.route)===index));const route=currentRoutes[index];$('routeInspector').innerHTML=renderRouteDetail(route,index)}
-    function renderRoutes(data){const routes=((data&&data.routes)||[]).slice(0,8);const cold=((data&&data.cold_approaches)||[]).slice(0,8);currentRoutes=routes;if(!routes.length){if(cold.length)return renderColdApproaches(cold);return '<div class="empty"><div><strong>No bridge candidates</strong>The current network graph did not match named target-side bridge terms.</div></div>';}
-      const nodesById=new Map(),edges=[];routes.forEach((r,routeIndex)=>{(r.path||[]).forEach((person,depth)=>{const id=routeNodeKey(person,depth);const role=depth===0?'me':depth===(r.path||[]).length-1?'target':(r.type||'candidate');if(!nodesById.has(id))nodesById.set(id,{...person,id,depth,role,routes:[routeIndex]});else nodesById.get(id).routes.push(routeIndex);if(depth>0){edges.push({source:routeNodeKey(r.path[depth-1],depth-1),target:id,route:routeIndex,type:r.type||'candidate',score:r.score})}})});
-      const nodes=[...nodesById.values()],width=1040,height=620,pos=routePositions(nodes,width,height);
-      const edgeSvg=edges.map(edge=>{const a=pos.get(edge.source),b=pos.get(edge.target);if(!a||!b)return'';const cls=`route-edge ${edge.type==='near_miss'?'near_miss':'verified'}`;const d=routePathD(a,b);return `<path class="${cls}" data-route="${edge.route}" d="${d}"></path><path class="route-hit" data-route="${edge.route}" d="${d}"></path>`}).join('');
-      const nodeHtml=nodes.map(node=>{const p=pos.get(node.id);const route=node.routes[0];const cls=['route-node',node.role==='me'?'me':'',node.role==='target'?'target':'',node.role==='near_miss'?'near_miss':''].filter(Boolean).join(' ');return `<button class="${cls}" data-route="${route}" style="left:${p.x}px;top:${p.y}px" title="${escapeHtml(personLabel(node))}">${escapeHtml(initials(node))}</button><div class="route-label" style="left:${p.x}px;top:${p.y+72}px"><strong>${escapeHtml(node.name||'Unknown')}</strong>${node.company?escapeHtml(node.company):''}</div>`}).join('');
-      setTimeout(()=>{document.querySelectorAll('[data-route]').forEach(el=>el.onclick=()=>selectRoute(Number(el.dataset.route)));selectRoute(0)},0);
-      const best=routes[0];const near=routes.filter(r=>r.type==='near_miss').length;return `<div class="route-stage"><div class="route-map"><div class="route-canvas"><svg class="edge-layer" viewBox="0 0 ${width} ${height}">${edgeSvg}</svg>${nodeHtml}</div></div><aside class="route-side"><h2>Pathways</h2><p class="sub">Click a node or route line to inspect why the path might work. Near-miss routes are shown with dashed amber links.</p><div class="route-metric"><div><strong>${routes.length}</strong><span>Routes</span></div><div><strong>${near}</strong><span>Near Miss</span></div></div><section id="routeInspector" class="route-detail-card">${renderRouteDetail(best,0)}</section></aside></div>`}
+function personLabel(p) {
+  return [p?.name, p?.company, p?.position].filter(Boolean).join(' · ') || 'Unknown';
+}
 
-    function renderColdApproaches(cold){const cards=cold.map(c=>`<article class="route-detail-card cold-card"><div class="detail-head"><h3>#${escapeHtml(c.rank||'')} ${escapeHtml(c.name||'Unknown')}</h3><strong>${escapeHtml(c.warmth_score||0)}/100</strong></div><div class="detail-body"><p><span class="confidence-pill">cold approach lead</span></p><p>${escapeHtml([c.company,c.relationship_to_target].filter(Boolean).join(' · '))}</p><p>${escapeHtml(c.outreach_reason||'')}</p><p><strong>Reply:</strong> ${escapeHtml(c.reply_probability||0)}/100 · <strong>Intro:</strong> ${escapeHtml(c.intro_probability||0)}/100</p>${c.proof?`<p><strong>Evidence:</strong> ${escapeHtml(c.proof)}</p>`:''}${c.source_url?`<p><a href="${escapeHtml(c.source_url)}" target="_blank" rel="noreferrer">Source</a></p>`:''}<p><strong>First ask:</strong> ${escapeHtml(c.first_ask||'Cold approach with a narrow, evidence-based ask.')}</p></div></article>`).join('');return `<div class="cold-approach-panel"><h2>No path found — best cold approaches</h2><p class="sub">These people came from the target-side map and are ranked by proximity, relationship strength, and likely accessibility.</p><div class="cold-grid">${cards}</div></div>`}
-    function renderRouteDetail(r,index=0){if(!r)return'';const hops=(r.path||[]).map((p,i)=>`<li><strong>${escapeHtml(p.name||'Unknown')}</strong>${personLabel(p)?`<br>${escapeHtml(personLabel(p))}`:''}</li>`).join('');const snippets=(r.snippets||[]).slice(0,5).map(s=>`<p><strong>${escapeHtml(s.term)}:</strong> ${escapeHtml(s.snippet)}</p>`).join('');return `<div class="detail-head"><h3>#${index+1} ${escapeHtml((r.path||[]).map(p=>p.name).filter(Boolean).join(' -> '))}</h3><strong>${escapeHtml(r.score)}</strong></div><div class="detail-body"><p><span class="confidence-pill">${escapeHtml(r.confidence||r.type||'candidate')}</span></p><p>${escapeHtml(r.explanation)}</p>${r.iffy_hop?`<p><strong>Iffy hop:</strong> ${escapeHtml(r.iffy_hop)}</p>`:''}<h3>Path</h3><ol class="path-list">${hops}</ol><h3>Evidence</h3>${snippets||'<p>No snippets.</p>'}<div class="tags">${(r.terms||[]).slice(0,10).map(t=>`<span>${escapeHtml(t)}</span>`).join('')}</div></div>`}
+function initials(p) {
+  const parts = String(p?.name || '?').trim().split(/\s+/).filter(Boolean);
+  return (parts.length > 1 ? parts[0][0] + parts[parts.length - 1][0] : parts[0].slice(0, 2)).toUpperCase();
+}
 
-    function boardNodeLabel(n){return [n.name,n.company,n.position].filter(Boolean).join(' · ')||'Unknown'}
-    function selectBoardNode(id){document.querySelectorAll('[data-board-node]').forEach(el=>el.classList.toggle('active',el.dataset.boardNode===id));const node=(currentBoard?.nodes||[]).find(n=>n.id===id);$('boardInspector').innerHTML=renderBoardNodeDetail(node)}
-    function renderBoardNodeDetail(node){if(!node)return'<p>Select a board node.</p>';return `<div class="detail-head"><h3>${escapeHtml(node.name||'Unknown')}</h3><strong>${escapeHtml(node.role||'lead')}</strong></div><div class="detail-body"><p>${escapeHtml(boardNodeLabel(node))}</p>${node.profile_url?`<p><a href="${escapeHtml(node.profile_url)}" target="_blank" rel="noreferrer">${escapeHtml(node.profile_url)}</a></p>`:''}<p><span class="confidence-pill">${node.highlighted?'highlighted path':'board lead'}</span></p><p>Appears in ${escapeHtml(node.route_count||0)} route(s).</p></div>`}
-    function renderBoard(board){currentBoard=board;if(!board||!(board.nodes||[]).length)return '<div class="empty"><div><strong>No board yet</strong>Run a path search to create a board.</div></div>';
-      const nodes=board.nodes||[],edges=board.edges||[],width=1040,height=620,pos=routePositions(nodes,width,height);
-      const edgeSvg=edges.map(edge=>{const a=pos.get(edge.source),b=pos.get(edge.target);if(!a||!b)return'';const cls=['route-edge',edge.type==='near_miss'||edge.type==='gateway'?'near_miss':'verified',edge.type==='gateway'?'gateway':'',edge.highlighted?'active':''].join(' ');const d=routePathD(a,b);return `<path class="${cls}" d="${d}"></path>`}).join('');
-      const nodeHtml=nodes.map(node=>{const p=pos.get(node.id);const cls=['route-node',node.role==='me'?'me':'',node.role==='target'?'target':'',node.role==='manual'?'manual':'',node.role==='ecosystem'?'ecosystem':'',node.role==='cold_approach'?'cold_approach':'',node.role==='lead'&&!node.highlighted?'near_miss':'',node.highlighted?'active':''].filter(Boolean).join(' ');return `<button class="${cls}" data-board-node="${escapeHtml(node.id)}" style="left:${p.x}px;top:${p.y}px" title="${escapeHtml(boardNodeLabel(node))}">${escapeHtml(initials(node))}</button><div class="route-label" style="left:${p.x}px;top:${p.y+72}px"><strong>${escapeHtml(node.name||'Unknown')}</strong>${node.company?escapeHtml(node.company):''}</div>`}).join('');
-      const leads=(board.leads||[]).slice(0,8).map(lead=>`<li><strong>${escapeHtml(lead.name||'Unknown')}</strong><span>${escapeHtml([lead.company,lead.position].filter(Boolean).join(' · '))}</span><em>${escapeHtml(lead.ask||'')}</em>${lead.creation_strategy?`<small>${escapeHtml(lead.creation_strategy)}</small>`:''}</li>`).join('');
-      setTimeout(()=>{document.querySelectorAll('[data-board-node]').forEach(el=>el.onclick=()=>selectBoardNode(el.dataset.boardNode));selectBoardNode((nodes.find(n=>n.highlighted)||nodes[1]||nodes[0]).id);const parent=$('boardParent');if(parent){parent.innerHTML=nodes.map(n=>`<option value="${escapeHtml(n.id)}">${escapeHtml(n.name||n.id)}</option>`).join('')}} ,0);
-      const terms=(board.ecosystem_terms||[]).slice(0,8).map(t=>`<span>${escapeHtml(t)}</span>`).join('');
-      return `<div class="board-toolbar"><div><h2>${escapeHtml(board.target||'Target')} Board</h2><p>${escapeHtml(board.summary?.working_paths||0)} working path(s), ${escapeHtml(board.summary?.near_misses||0)} near miss(es), ${escapeHtml(board.summary?.gateways||0)} gateway lead(s), ${escapeHtml(board.summary?.cold_approaches||0)} cold approach lead(s)</p><div class="tags">${terms}</div></div><a class="secondary button-link" href="/api/boards/${encodeURIComponent(board.id)}/csv">Download CSV</a></div><div class="route-stage board-stage"><div class="route-map"><div class="route-canvas"><svg class="edge-layer" viewBox="0 0 ${width} ${height}">${edgeSvg}</svg>${nodeHtml}</div></div><aside class="route-side"><h2>Path Creation Leads</h2><ol class="lead-list">${leads||'<li><strong>No leads yet</strong></li>'}</ol><section id="boardInspector" class="route-detail-card">${renderBoardNodeDetail(nodes[0])}</section><form id="boardNodeForm" class="board-form"><h2>Add Node</h2><select id="boardParent"></select><input id="boardName" placeholder="Name" required><input id="boardCompany" placeholder="Company"><input id="boardPosition" placeholder="Position"><input id="boardUrl" placeholder="URL"><button class="primary" type="submit">Add to Board</button></form></aside></div>`;
-    }
+function nodeClass(node) {
+  return ['board-node', node.role || 'lead', node.highlighted ? 'active' : '', node.id === selectedBoardNodeId ? 'selected' : ''].filter(Boolean).join(' ');
+}
 
-    $('uploadForm').onsubmit=async(e)=>{e.preventDefault();const fd=new FormData();fd.append('file',$('csvFile').files[0]);fd.append('parent_id',$('uploadMode').value==='selected'?selectedNodeId:'me');fd.append('replace_root',$('uploadMode').value==='root'?'1':'0');setStatus('running','Uploading');const res=await fetch('/api/network/upload',{method:'POST',body:fd});const data=await res.json();setStatus(res.ok?'done':'error',res.ok?'Uploaded':'Error');await loadNetwork();alert(res.ok?`Added ${data.added} connections.`:data.error)};
-    $('manualForm').onsubmit=async(e)=>{e.preventDefault();const payload={parent_id:selectedNodeId,name:$('manualName').value,company:$('manualCompany').value,position:$('manualPosition').value,profile_url:$('manualUrl').value};const res=await fetch('/api/network/manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok)alert(data.error);$('manualForm').reset();await loadNetwork()};
-    $('resetGraph').onclick=async()=>{if(!confirm('Reset the whole graph?'))return;await fetch('/api/network/reset',{method:'POST'});selectedNodeId='me';await loadNetwork()};
+function boardNodeId(person, index) {
+  if (index === 0 || person?.id === 'me') return 'me';
+  const raw = String(person?.profile_url || person?.name || `node-${index}`).toLowerCase();
+  return raw.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `node-${index}`;
+}
 
-    let pollTimer=null;$('researchForm').onsubmit=async(e)=>{e.preventDefault();const payload={person:$('person').value.trim(),context:$('context').value.trim(),max_results:Number($('maxResults').value||8),max_pages:Number($('maxPages').value||8),max_adjacent_queries:Number($('adjacent').value||20),match_limit:Number($('matchLimit').value||50),search_provider:$('searchProvider').value,use_apify_instagram:$('useApifyInstagram').checked,allow_insecure_ssl:$('allowInsecureSsl').checked,no_adjacent_pass:$('skipAdjacent').checked,no_institution_pass:$('skipInstitution').checked,no_verify_hops:!$('verifyHops').checked,no_seed_map:!$('seedMap').checked,cache_days:Number($('cacheDays').value||30),force_refresh:$('forceRefresh').checked};$('emptyState').hidden=true;$('boardPane').innerHTML='';$('routesPane').innerHTML='';$('dossierPane').innerHTML='';$('matchesPane').innerHTML='';$('logPane').textContent='';$('fileLinks').innerHTML='';setStatus('running','Starting');const res=await fetch('/api/research',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){setStatus('error','Error');$('logPane').textContent=data.error;return}pollJob(data.job_id)};
-    async function pollJob(id){if(pollTimer)clearTimeout(pollTimer);const res=await fetch(`/api/jobs/${id}`);const job=await res.json();renderJob(job);if(job.status==='running'||job.status==='queued')pollTimer=setTimeout(()=>pollJob(id),1800)}
-    function bindBoardForm(){const form=$('boardNodeForm');if(!form||form.dataset.bound)return;form.dataset.bound='1';form.onsubmit=async(e)=>{e.preventDefault();if(!currentBoard)return;const payload={parent_id:$('boardParent').value,name:$('boardName').value,company:$('boardCompany').value,position:$('boardPosition').value,profile_url:$('boardUrl').value};const res=await fetch(`/api/boards/${encodeURIComponent(currentBoard.id)}/nodes`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){alert(data.error);return}currentBoard=data;$('boardPane').innerHTML=renderBoard(currentBoard);bindBoardForm()}};
-    function renderJob(job){setStatus(job.status==='done'?'done':job.status==='error'?'error':'running',job.status==='done'?'Complete':job.status==='error'?'Error':'Running');$('logPane').textContent=(job.log||[]).join('\\n');$('jobMeta').innerHTML=`<p>${escapeHtml(job.message||'')}</p>`;if(job.board){$('boardPane').innerHTML=renderBoard(job.board);bindBoardForm()}if(job.routes)$('routesPane').innerHTML=renderRoutes(job.routes);if(job.dossier)$('dossierPane').innerHTML=renderMarkdown(job.dossier);if(job.matches)$('matchesPane').innerHTML=renderMarkdown(job.matches);if(job.files){const links=[];if(job.files.dossier)links.push(`<a href="/download?path=${encodeURIComponent(job.files.dossier)}">Dossier</a>`);if(job.files.matches)links.push(`<a href="/download?path=${encodeURIComponent(job.files.matches)}">Match report</a>`);$('fileLinks').innerHTML=links.join('')}if(job.status==='error'){$('logPane').hidden=false}}
-    $('clearButton').onclick=()=>{['boardPane','routesPane','dossierPane','matchesPane'].forEach(id=>$(id).innerHTML='');$('logPane').textContent='';$('fileLinks').innerHTML='';$('emptyState').hidden=false;setStatus('','Idle')};
-    loadNetwork();
+function boardPositions(nodes, width, height) {
+  const byDepth = {};
+  nodes.forEach(node => {
+    const depth = Number(node.depth || (node.role === 'target' ? 5 : 1));
+    (byDepth[depth] ||= []).push(node);
+  });
+  const depths = Object.keys(byDepth).map(Number).sort((a, b) => a - b);
+  const pos = new Map();
+  depths.forEach((depth, depthIndex) => {
+    const group = byDepth[depth];
+    const x = 70 + (depthIndex / Math.max(depths.length - 1, 1)) * (width - 190);
+    group.forEach((node, index) => {
+      const y = 70 + ((index + 1) / (group.length + 1)) * (height - 160);
+      pos.set(node.id, {x, y});
+    });
+  });
+  return pos;
+}
+
+function normalizeBoard(board) {
+  if (!board) return null;
+  board.nodes ||= [];
+  board.edges ||= [];
+  if (!board.nodes.some(node => node.id === 'me')) {
+    board.nodes.unshift({id: 'me', name: 'You', depth: 0, role: 'me', highlighted: true});
+  }
+  return board;
+}
+
+async function loadBoards(preferredId = '') {
+  const res = await fetch('/api/boards');
+  const data = await res.json();
+  boards = data.boards || [];
+  currentBoard = normalizeBoard(preferredId ? await fetchBoard(preferredId) : data.current);
+  renderBoardPicker();
+  renderBoard();
+}
+
+async function fetchBoard(id) {
+  const res = await fetch(`/api/boards/${encodeURIComponent(id)}`);
+  return res.ok ? res.json() : null;
+}
+
+function renderBoardPicker() {
+  $('boardSelect').innerHTML = boards.map(board => `<option value="${escapeHtml(board.id)}">${escapeHtml(board.name || board.target || 'Untitled Board')}</option>`).join('');
+  if (currentBoard) {
+    $('boardSelect').value = currentBoard.id;
+    $('boardName').value = currentBoard.name || currentBoard.target || 'Untitled Board';
+    $('exportBoard').href = `/api/boards/${encodeURIComponent(currentBoard.id)}/csv`;
+  }
+}
+
+function renderBoard() {
+  currentBoard = normalizeBoard(currentBoard);
+  if (!currentBoard) return;
+  const nodes = currentBoard.nodes || [];
+  const edges = currentBoard.edges || [];
+  const width = Math.max(1160, window.innerWidth - 420);
+  const height = Math.max(720, window.innerHeight - 82);
+  const pos = boardPositions(nodes, width, height);
+  const edgeSvg = edges.map(edge => {
+    const a = pos.get(edge.source), b = pos.get(edge.target);
+    if (!a || !b) return '';
+    const mid = (a.x + b.x) / 2;
+    const cls = ['board-edge', edge.type || 'candidate', edge.highlighted ? 'active' : ''].filter(Boolean).join(' ');
+    return `<path class="${cls}" d="M ${a.x + 31} ${a.y + 31} C ${mid} ${a.y + 31}, ${mid} ${b.y + 31}, ${b.x + 31} ${b.y + 31}"></path>`;
+  }).join('');
+  const nodeHtml = nodes.map(node => {
+    const p = pos.get(node.id);
+    return `<button class="${nodeClass(node)}" data-board-node="${escapeHtml(node.id)}" style="left:${p.x}px;top:${p.y}px" title="${escapeHtml(personLabel(node))}">${escapeHtml(initials(node))}</button><div class="board-label" style="left:${p.x}px;top:${p.y + 72}px"><strong>${escapeHtml(node.name || 'Unknown')}</strong>${node.company ? escapeHtml(node.company) : ''}</div>`;
+  }).join('');
+  $('boardCanvas').innerHTML = `<div class="board-map" style="width:${width}px;height:${height}px"><svg class="edge-layer" viewBox="0 0 ${width} ${height}">${edgeSvg}</svg>${nodeHtml}</div>`;
+  document.querySelectorAll('[data-board-node]').forEach(el => el.onclick = () => selectBoardNode(el.dataset.boardNode));
+  selectBoardNode(selectedBoardNodeId, false);
+}
+
+function selectBoardNode(id, rerender = true) {
+  selectedBoardNodeId = id || 'me';
+  if (rerender) renderBoard();
+  const node = (currentBoard?.nodes || []).find(item => item.id === selectedBoardNodeId);
+  $('nodeInspector').innerHTML = renderNodeInspector(node);
+}
+
+function downloadLink(path, label) {
+  if (!path) return '';
+  const url = `/download?path=${encodeURIComponent(path)}`;
+  return `<a class="secondary button-link" href="${escapeHtml(url)}">${escapeHtml(label)}</a>`;
+}
+
+function renderNodeInspector(node) {
+  if (!node) return '<div class="inspector-empty">Select a node.</div>';
+  const canRun = node.id !== 'me' && node.name;
+  const profile = safeUrl(node.profile_url);
+  return `
+    <div class="inspector-head">
+      <h2>${escapeHtml(node.name || 'Unknown')}</h2>
+      <span>${escapeHtml(node.role || 'lead')}</span>
+    </div>
+    <div class="inspector-body">
+      <p>${escapeHtml([node.company, node.position].filter(Boolean).join(' · '))}</p>
+      ${profile ? `<p><a href="${escapeHtml(profile)}" target="_blank" rel="noreferrer">${escapeHtml(profile)}</a></p>` : ''}
+      <p><strong>Source:</strong> ${escapeHtml(node.source || 'board')}</p>
+      <p><strong>Routes:</strong> ${escapeHtml(node.route_count || 0)}</p>
+      <div class="inspector-actions">
+        ${canRun ? `<button class="primary" type="button" id="runNode">Run Toward Node</button>` : ''}
+        ${downloadLink(node.dossier_path, 'Dossier')}
+        ${downloadLink(node.matches_path, 'Report')}
+      </div>
+    </div>`;
+}
+
+function payloadForRun(person, context = '') {
+  return {
+    board_id: currentBoard?.id,
+    person,
+    context,
+    max_results: Number($('maxResults').value || 8),
+    max_pages: Number($('maxPages').value || 8),
+    max_adjacent_queries: Number($('adjacent').value || 20),
+    match_limit: Number($('matchLimit').value || 50),
+    search_provider: $('searchProvider').value,
+    use_apify_instagram: $('useApifyInstagram').checked,
+    allow_insecure_ssl: $('allowInsecureSsl').checked,
+    no_adjacent_pass: $('skipAdjacent').checked,
+    no_institution_pass: $('skipInstitution').checked,
+    no_verify_hops: !$('verifyHops').checked,
+    no_seed_map: !$('seedMap').checked,
+    cache_days: Number($('cacheDays').value || 30),
+    force_refresh: $('forceRefresh').checked,
+  };
+}
+
+async function runResearch(person, context = '') {
+  if (!currentBoard) await loadBoards();
+  setStatus('running', 'Starting');
+  const res = await fetch('/api/research', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payloadForRun(person, context))});
+  const data = await res.json();
+  if (!res.ok) {
+    setStatus('error', 'Error');
+    $('nodeInspector').innerHTML = `<div class="inspector-empty">${escapeHtml(data.error || 'Research failed.')}</div>`;
+    return;
+  }
+  pollJob(data.job_id);
+}
+
+async function pollJob(id) {
+  if (pollTimer) clearTimeout(pollTimer);
+  const res = await fetch(`/api/jobs/${id}`);
+  const job = await res.json();
+  setStatus(job.status === 'done' ? 'done' : job.status === 'error' ? 'error' : 'running', job.status === 'done' ? 'Complete' : job.status === 'error' ? 'Error' : 'Running');
+  if (job.board) {
+    currentBoard = normalizeBoard(job.board);
+    await refreshBoardListOnly();
+    renderBoardPicker();
+    renderBoard();
+  }
+  if (job.status === 'running' || job.status === 'queued') pollTimer = setTimeout(() => pollJob(id), 1800);
+  if (job.status === 'error') $('nodeInspector').innerHTML = `<div class="inspector-empty">${escapeHtml(job.message || 'Research failed.')}</div>`;
+}
+
+async function refreshBoardListOnly() {
+  const res = await fetch('/api/boards');
+  const data = await res.json();
+  boards = data.boards || [];
+}
+
+document.querySelectorAll('.nav-btn').forEach(btn => btn.onclick = () => {
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b === btn));
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === btn.dataset.view));
+  if (btn.dataset.view === 'graphView') renderFullGraph();
+});
+
+$('boardSelect').onchange = async () => {
+  currentBoard = normalizeBoard(await fetchBoard($('boardSelect').value));
+  selectedBoardNodeId = 'me';
+  renderBoardPicker();
+  renderBoard();
+};
+
+$('newBoard').onclick = async () => {
+  const name = prompt('Board name', 'Untitled Board') || 'Untitled Board';
+  const res = await fetch('/api/boards', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name})});
+  currentBoard = normalizeBoard(await res.json());
+  await loadBoards(currentBoard.id);
+};
+
+$('saveBoard').onclick = async () => {
+  if (!currentBoard) return;
+  currentBoard.name = $('boardName').value.trim() || 'Untitled Board';
+  const res = await fetch(`/api/boards/${encodeURIComponent(currentBoard.id)}/save`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: currentBoard.name, board: currentBoard})});
+  currentBoard = normalizeBoard(await res.json());
+  await loadBoards(currentBoard.id);
+  setStatus('done', 'Saved');
+};
+
+$('researchForm').onsubmit = async (e) => {
+  e.preventDefault();
+  await runResearch($('person').value.trim(), $('context').value.trim());
+};
+
+$('nodeInspector').onclick = async (e) => {
+  if (e.target?.id !== 'runNode') return;
+  const node = (currentBoard?.nodes || []).find(item => item.id === selectedBoardNodeId);
+  if (!node) return;
+  $('person').value = node.name || '';
+  $('context').value = node.company || node.position || '';
+  await runResearch(node.name, node.company || node.position || '');
+};
+
+async function loadNetwork() {
+  const res = await fetch('/api/network');
+  currentNetwork = await res.json();
+  renderNetworkPanel();
+  renderFullGraph();
+}
+
+function renderNetworkPanel() {
+  const s = currentNetwork.stats || {};
+  $('networkStats').innerHTML = [['Nodes', s.nodes || 0], ['Edges', s.edges || 0], ['First-degree', s.first_degree || 0], ['2nd+ degree', s.second_degree_plus || 0]].map(([k, v]) => `<div class="stat"><strong>${v}</strong><span>${k}</span></div>`).join('');
+  const nodes = [...(currentNetwork.nodes || [])].sort((a, b) => (a.depth || 0) - (b.depth || 0) || String(a.name).localeCompare(String(b.name)));
+  $('connectionList').innerHTML = nodes.map(n => `<div class="person-card ${n.id === selectedNodeId ? 'active' : ''}" data-id="${escapeHtml(n.id)}"><strong>${escapeHtml(n.name)}</strong><span>${escapeHtml([n.company, n.position].filter(Boolean).join(' · '))}</span><span>${escapeHtml(n.profile_url || '')}</span></div>`).join('');
+  document.querySelectorAll('.person-card').forEach(card => card.onclick = () => { selectedNodeId = card.dataset.id; renderNetworkPanel(); });
+  const selected = nodes.find(n => n.id === selectedNodeId) || nodes[0];
+  if (selected) {
+    selectedNodeId = selected.id;
+    $('selectedCard').innerHTML = `<h2>${escapeHtml(selected.name)}</h2><p>${escapeHtml([selected.company, selected.position].filter(Boolean).join(' · '))}</p><p><code>${escapeHtml(selected.profile_url || selected.id)}</code></p><p>Depth: ${escapeHtml(selected.depth)}</p>`;
+  }
+}
+
+function graphPositions(nodes, width, height) {
+  const byDepth = {};
+  nodes.forEach(n => { const d = Number(n.depth || 0); (byDepth[d] ||= []).push(n); });
+  const depths = Object.keys(byDepth).map(Number).sort((a, b) => a - b);
+  const pos = new Map();
+  depths.forEach((d, di) => {
+    const group = byDepth[d];
+    group.forEach((n, i) => {
+      const x = 60 + (di / (Math.max(depths.length - 1, 1))) * (width - 140);
+      const y = 50 + ((i + 1) / (group.length + 1)) * (height - 120);
+      pos.set(n.id, {x, y});
+    });
+  });
+  return pos;
+}
+
+function renderGraph(containerId, nodes, edges, options = {}) {
+  edges = Array.isArray(edges) ? edges : [];
+  const width = 1100, height = Math.max(560, nodes.length * 18);
+  const pos = graphPositions(nodes, width, height);
+  const edgeSvg = edges.map(e => {
+    const a = pos.get(e.source), b = pos.get(e.target);
+    if (!a || !b) return '';
+    const mid = (a.x + b.x) / 2;
+    return `<path d="M ${a.x + 29} ${a.y + 29} C ${mid} ${a.y + 29}, ${mid} ${b.y + 29}, ${b.x} ${b.y + 29}" fill="none" stroke="#cbd5e1" stroke-width="2"></path>`;
+  }).join('');
+  const nodeHtml = nodes.map(n => {
+    const p = pos.get(n.id);
+    const cls = n.id === 'me' ? 'me' : options.targetId === n.id ? 'target' : '';
+    return `<div class="node ${cls}" style="left:${p.x}px;top:${p.y}px" title="${escapeHtml(personLabel(n))}">${escapeHtml(initials(n))}</div><div class="node-label" style="left:${p.x}px;top:${p.y + 64}px">${escapeHtml(n.name)}${n.company ? '<br>' + escapeHtml(n.company) : ''}</div>`;
+  }).join('');
+  $(containerId).innerHTML = `<div class="network-map"><div class="network-canvas" style="height:${height}px"><svg class="edge-layer" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${edgeSvg}</svg>${nodeHtml}</div></div>`;
+}
+
+function renderFullGraph() {
+  renderGraph('fullGraph', currentNetwork.nodes || [], currentNetwork.edges || []);
+}
+
+$('uploadForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const fd = new FormData();
+  fd.append('file', $('csvFile').files[0]);
+  fd.append('parent_id', $('uploadMode').value === 'selected' ? selectedNodeId : 'me');
+  fd.append('replace_root', $('uploadMode').value === 'root' ? '1' : '0');
+  setStatus('running', 'Uploading');
+  const res = await fetch('/api/network/upload', {method: 'POST', body: fd});
+  const data = await res.json();
+  setStatus(res.ok ? 'done' : 'error', res.ok ? 'Uploaded' : 'Error');
+  await loadNetwork();
+  alert(res.ok ? `Added ${data.added} connections.` : data.error);
+};
+
+$('manualForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const payload = {parent_id: selectedNodeId, name: $('manualName').value, company: $('manualCompany').value, position: $('manualPosition').value, profile_url: $('manualUrl').value};
+  const res = await fetch('/api/network/manual', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+  const data = await res.json();
+  if (!res.ok) alert(data.error);
+  $('manualForm').reset();
+  await loadNetwork();
+};
+
+$('resetGraph').onclick = async () => {
+  if (!confirm('Reset the whole graph?')) return;
+  await fetch('/api/network/reset', {method: 'POST'});
+  selectedNodeId = 'me';
+  await loadNetwork();
+};
+
+window.addEventListener('resize', () => renderBoard());
+
+loadBoards();
+loadNetwork();
