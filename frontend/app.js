@@ -5,6 +5,7 @@ let selectedNodeId = 'me';
 let boards = [];
 let currentBoard = null;
 let selectedBoardNodeId = 'me';
+let selectedBoardEdgeIndex = null;
 let pollTimer = null;
 
 function setStatus(status, label) {
@@ -175,12 +176,13 @@ function renderBoard() {
   const width = Math.max(1160, window.innerWidth - 420);
   const height = Math.max(720, window.innerHeight - 82);
   const pos = boardPositions(nodes, width, height);
-  const edgeSvg = edges.map(edge => {
+  const edgeSvg = edges.map((edge, edgeIndex) => {
     const a = pos.get(edge.source), b = pos.get(edge.target);
     if (!a || !b) return '';
     const mid = (a.x + b.x) / 2;
     const cls = ['board-edge', edge.type || 'candidate', edge.highlighted ? 'active' : ''].filter(Boolean).join(' ');
-    return `<path class="${cls}" d="M ${a.x + 31} ${a.y + 31} C ${mid} ${a.y + 31}, ${mid} ${b.y + 31}, ${b.x + 31} ${b.y + 31}"></path>`;
+    const d = `M ${a.x + 31} ${a.y + 31} C ${mid} ${a.y + 31}, ${mid} ${b.y + 31}, ${b.x + 31} ${b.y + 31}`;
+    return `<path class="${cls}" d="${d}"></path><path class="board-edge-hit" data-board-edge="${edgeIndex}" d="${d}"></path>`;
   }).join('');
   const nodeHtml = nodes.map(node => {
     const p = pos.get(node.id);
@@ -188,14 +190,23 @@ function renderBoard() {
   }).join('');
   $('boardCanvas').innerHTML = `<div class="board-map" style="width:${width}px;height:${height}px"><svg class="edge-layer" viewBox="0 0 ${width} ${height}">${edgeSvg}</svg>${nodeHtml}</div>`;
   document.querySelectorAll('[data-board-node]').forEach(el => el.onclick = () => selectBoardNode(el.dataset.boardNode));
+  document.querySelectorAll('[data-board-edge]').forEach(el => el.onclick = () => selectBoardEdge(Number(el.dataset.boardEdge)));
   selectBoardNode(selectedBoardNodeId, false);
 }
 
 function selectBoardNode(id, rerender = true) {
   selectedBoardNodeId = id || 'me';
+  selectedBoardEdgeIndex = null;
   if (rerender) renderBoard();
   const node = (currentBoard?.nodes || []).find(item => item.id === selectedBoardNodeId);
   $('nodeInspector').innerHTML = renderNodeInspector(node);
+}
+
+function selectBoardEdge(index) {
+  selectedBoardEdgeIndex = index;
+  selectedBoardNodeId = '';
+  const edge = (currentBoard?.edges || [])[index];
+  $('nodeInspector').innerHTML = renderEdgeInspector(edge);
 }
 
 function downloadLink(path, label) {
@@ -223,6 +234,31 @@ function renderNodeInspector(node) {
         ${downloadLink(node.dossier_path, 'Dossier')}
         ${downloadLink(node.matches_path, 'Report')}
       </div>
+    </div>`;
+}
+
+function renderEdgeInspector(edge) {
+  if (!edge) return '<div class="inspector-empty">Select a link.</div>';
+  const source = (currentBoard?.nodes || []).find(node => node.id === edge.source) || {};
+  const target = (currentBoard?.nodes || []).find(node => node.id === edge.target) || {};
+  const showReasons = currentBoard?.show_link_reasons;
+  const sourceUrl = safeUrl(edge.source_url);
+  const targetUrl = safeUrl(edge.target_source_url);
+  return `
+    <div class="inspector-head">
+      <h2>${escapeHtml(source.name || 'Source')} -> ${escapeHtml(target.name || 'Target')}</h2>
+      <span>${escapeHtml(edge.confidence || edge.type || 'link')}</span>
+    </div>
+    <div class="inspector-body">
+      ${showReasons ? `
+        <p><strong>Why this link exists:</strong> ${escapeHtml(edge.reason || 'This link was added by the verified-hop workflow.')}</p>
+        ${edge.evidence ? `<p><strong>Evidence:</strong> ${escapeHtml(edge.evidence)}</p>` : ''}
+        ${edge.relationship_type ? `<p><strong>Relationship:</strong> ${escapeHtml(edge.relationship_type)}</p>` : ''}
+        <div class="inspector-actions">
+          ${sourceUrl ? `<a class="secondary button-link" href="${escapeHtml(sourceUrl)}" target="_blank" rel="noreferrer">Source</a>` : ''}
+          ${targetUrl ? `<a class="secondary button-link" href="${escapeHtml(targetUrl)}" target="_blank" rel="noreferrer">Target source</a>` : ''}
+        </div>
+      ` : '<p>Turn on Verify hops before running to attach source-backed reasoning to links.</p>'}
     </div>`;
 }
 

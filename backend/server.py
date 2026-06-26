@@ -240,7 +240,7 @@ def graph_summary():
     }
 
 
-def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit):
+def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit, match_payload=None):
     dossier_text = dossier_network_matcher.read_text(dossier_path)
     rows = dossier_network_matcher.load_profiles(profiles_csv)
     artemis_map = dossier_network_matcher.artemis_map_from_dossier(dossier_text)
@@ -258,6 +258,7 @@ def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit):
         matches = dossier_network_matcher.score_profiles(rows, terms, min_score)
         clue_matches = []
     routes = []
+    verified_paths = (match_payload or {}).get("verified_paths", [])
 
     def path_people_for_row(row, target_chain=None):
         paths = dossier_network_matcher.parse_paths(row)
@@ -301,7 +302,47 @@ def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit):
             ),
         }
 
-    for index, match in enumerate(matches[:limit], 1):
+    for index, item in enumerate(verified_paths[:limit], 1):
+        match = item.get("match", {})
+        row = match.get("row", {})
+        if not row:
+            continue
+        snippets = match.get("snippets", [])[:8]
+        target_node = item.get("target_node", {})
+        verification = item.get("verification", {})
+        target_chain = [name for name in item.get("target_chain", []) if name]
+        evidence = verification.get("evidence", "")
+        source_url = verification.get("source_url", "")
+        reason = evidence or (
+            f"Verified public relationship between {profile_payload(row)['name']} "
+            f"and {target_node.get('name', 'target-side node')}."
+        )
+        routes.append(
+            {
+                "rank": index,
+                "score": 0.96,
+                "raw_score": match.get("score", 0),
+                "type": "verified",
+                "confidence": "verified public path",
+                "profile": profile_payload(row),
+                "path": path_people_for_row(row, target_chain),
+                "terms": [snippet.get("term", "") for snippet in snippets],
+                "snippets": snippets,
+                "explanation": reason,
+                "link_reason": reason,
+                "evidence": evidence,
+                "source_url": source_url,
+                "relationship_type": verification.get("relationship_type", ""),
+                "freshness": verification.get("freshness", ""),
+                "friction": verification.get("friction", ""),
+                "target_source_url": target_node.get("source_url", ""),
+                "target_proof": target_node.get("proof", ""),
+                "iffy_hop": "",
+            }
+        )
+
+    remaining_limit = max(0, limit - len(routes))
+    for index, match in enumerate(matches[:remaining_limit], len(routes) + 1):
         row = match["row"]
         snippets = match.get("snippets", [])[:8]
         terms_hit = [snippet["term"] for snippet in snippets]
@@ -331,6 +372,7 @@ def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit):
                 "terms": terms_hit,
                 "snippets": snippets,
                 "explanation": explanation,
+                "link_reason": explanation,
                 "iffy_hop": f"{profile_payload(row)['name']} -> {target_people[0].get('name', 'target-side bridge')}" if target_people else "",
             }
         )
@@ -383,6 +425,7 @@ def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit):
         "gateways": gateways,
         "cold_approaches": cold_approaches,
         "ecosystem_terms": ecosystem_terms,
+        "verification_enabled": bool((match_payload or {}).get("verification_enabled")),
     }
 
 
@@ -426,6 +469,7 @@ def board_from_routes(job_id, person, context, routes_payload):
         path = route.get("path", [])
         route_type = route.get("type") or "candidate"
         highlighted = has_working_path and route_type != "near_miss"
+        link_reason = route.get("link_reason") or route.get("explanation", "")
         for depth, person_item in enumerate(path):
             node_id = board_node_id(person_item, depth)
             role = "target" if depth == len(path) - 1 else "lead" if depth > 0 else "me"
@@ -453,6 +497,12 @@ def board_from_routes(job_id, person, context, routes_payload):
                         "route": route_index,
                         "type": route_type,
                         "highlighted": highlighted,
+                        "reason": link_reason,
+                        "evidence": route.get("evidence", ""),
+                        "source_url": route.get("source_url", ""),
+                        "target_source_url": route.get("target_source_url", ""),
+                        "relationship_type": route.get("relationship_type", ""),
+                        "confidence": route.get("confidence", ""),
                     }
                 )
         if path:
@@ -479,6 +529,7 @@ def board_from_routes(job_id, person, context, routes_payload):
     for gateway_index, gateway in enumerate(gateways):
         path = gateway.get("path", [])
         route_index = len(routes) + gateway_index
+        link_reason = gateway.get("link_reason") or gateway.get("explanation", "")
         for depth, person_item in enumerate(path):
             node_id = board_node_id(person_item, depth)
             role = "target" if depth == len(path) - 1 else "ecosystem" if depth > 1 else "lead" if depth > 0 else "me"
@@ -505,6 +556,10 @@ def board_from_routes(job_id, person, context, routes_payload):
                         "route": route_index,
                         "type": "gateway",
                         "highlighted": False,
+                        "reason": link_reason,
+                        "evidence": gateway.get("evidence", ""),
+                        "source_url": gateway.get("source_url", ""),
+                        "confidence": gateway.get("confidence", ""),
                     }
                 )
         lead_person = gateway.get("profile") or (path[1] if len(path) > 1 else {})
@@ -566,6 +621,10 @@ def board_from_routes(job_id, person, context, routes_payload):
                 "route": f"cold-{cold_index}",
                 "type": "cold_approach",
                 "highlighted": False,
+                "reason": candidate.get("outreach_reason", ""),
+                "evidence": candidate.get("proof", ""),
+                "source_url": candidate.get("source_url", ""),
+                "confidence": "cold approach lead",
             }
         )
         leads.append(
@@ -599,6 +658,7 @@ def board_from_routes(job_id, person, context, routes_payload):
         "nodes": list(nodes.values()),
         "edges": edges,
         "leads": leads,
+        "show_link_reasons": bool((routes_payload or {}).get("verification_enabled")),
     }
     save_board(board)
     return board
@@ -766,6 +826,7 @@ def merge_boards(base, incoming, run_person, run_context, dossier_path="", match
     base["ecosystem_terms"] = dossier_network_matcher.unique(
         list(base.get("ecosystem_terms", [])) + list(incoming.get("ecosystem_terms", []))
     )[:40]
+    base["show_link_reasons"] = bool(base.get("show_link_reasons") or incoming.get("show_link_reasons"))
     base["updated_at"] = time.time()
     base["saved"] = False
     recompute_board_summary(base)
@@ -993,8 +1054,8 @@ def run_job(job_id, payload):
         research_person_and_network.build_dossier(args, person, context, dossier_path)
         update_job(job_id, files={"dossier": dossier_path}, dossier=read_file(dossier_path), log=f"Saved dossier: {dossier_path}")
         update_job(job_id, message="Checking graph/network matches...", log=f"Checking network matches in {profiles_csv}.")
-        research_person_and_network.build_network_matches(args, dossier_path, matches_path)
-        routes = route_payload(dossier_path, profiles_csv, args.extra_term, args.min_score, args.match_limit)
+        match_payload = research_person_and_network.build_network_matches(args, dossier_path, matches_path)
+        routes = route_payload(dossier_path, profiles_csv, args.extra_term, args.min_score, args.match_limit, match_payload)
         generated_board = board_from_routes(job_id, person, context, routes)
         board = generated_board
         if board_id:

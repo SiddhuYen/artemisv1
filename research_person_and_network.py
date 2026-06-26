@@ -106,9 +106,27 @@ def build_network_matches(args, dossier_path, matches_path):
             verification_enabled=args.verify_hops,
             expansion_nodes=expansion_nodes,
         )
+        return {
+            "artemis_map": artemis_map,
+            "bridge_matches": bridge_matches,
+            "clue_matches": clue_matches,
+            "bridge_terms": bridge_terms,
+            "clue_terms": clue_terms,
+            "verified_paths": verified_paths,
+            "rejected_candidates": rejected_candidates,
+            "verification_enabled": args.verify_hops,
+        }
     else:
         matches = dossier_network_matcher.score_profiles(rows, fallback_terms, args.min_score)
         dossier_network_matcher.write_report(matches, fallback_terms, matches_path, args.match_limit)
+        return {
+            "artemis_map": artemis_map,
+            "matches": matches,
+            "terms": fallback_terms,
+            "verified_paths": [],
+            "rejected_candidates": [],
+            "verification_enabled": False,
+        }
 
 
 def parse_args():
