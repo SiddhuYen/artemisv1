@@ -246,6 +246,8 @@ def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit):
     artemis_map = dossier_network_matcher.artemis_map_from_dossier(dossier_text)
     fallback_terms = dossier_network_matcher.unique(dossier_network_matcher.extract_terms(dossier_text) + extra_terms)
     target_name = artemis_map.get("target") or "Target"
+    bridge_terms = []
+    clue_terms = []
     if artemis_map.get("closest_people"):
         matches, clue_matches, _, bridge_terms, clue_terms = dossier_network_matcher.score_artemis_profiles(
             rows, artemis_map, fallback_terms, min_score
@@ -272,6 +274,32 @@ def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit):
         if target_name and (not people or people[-1].get("name") != target_name):
             people.append({"name": target_name, "company": "", "position": "", "profile_url": ""})
         return people
+
+    def gateway_payload(match, index):
+        row = match["row"]
+        snippets = match.get("snippets", [])[:8]
+        terms_hit = [snippet.get("term", "") for snippet in snippets if snippet.get("term")]
+        person = profile_payload(row)
+        score = min(0.82, 0.24 + (match.get("score", 0) * 0.07))
+        return {
+            "rank": index,
+            "score": round(score, 2),
+            "raw_score": match.get("score", 0),
+            "type": "gateway",
+            "confidence": "path creation lead",
+            "profile": person,
+            "path": path_people_for_row(row, ["Target ecosystem", target_name]),
+            "terms": terms_hit,
+            "snippets": snippets,
+            "explanation": (
+                f"{format_person(row)} does not prove an intro path yet, but overlaps with the target ecosystem "
+                f"through {', '.join(terms_hit[:4]) or 'public target-side clues'}. Use them to create a bridge."
+            ),
+            "creation_strategy": (
+                "Ask this person for the most specific operator, recruiter, investor, customer, supplier, "
+                "event host, or community lead they know inside the target ecosystem."
+            ),
+        }
 
     for index, match in enumerate(matches[:limit], 1):
         row = match["row"]
@@ -335,7 +363,17 @@ def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit):
                     "iffy_hop": f"{profile_payload(row)['name']} -> {target_node.get('name', 'target-side clue')}",
                 }
             )
-    return {"terms": terms, "routes": routes}
+    gateways = [gateway_payload(match, index) for index, match in enumerate(clue_matches[: min(limit, 12)], 1)]
+    ecosystem_terms = dossier_network_matcher.unique(
+        bridge_terms[:20]
+        + clue_terms[:20]
+        + [
+            item.get("term", "")
+            for item in artemis_map.get("rejected_clues", [])
+            if isinstance(item, dict)
+        ][:20]
+    )
+    return {"terms": terms, "routes": routes, "gateways": gateways, "ecosystem_terms": ecosystem_terms}
 
 
 def board_node_id(person, index):
@@ -346,6 +384,8 @@ def board_node_id(person, index):
 
 def board_from_routes(job_id, person, context, routes_payload):
     routes = (routes_payload or {}).get("routes", [])[:8]
+    gateways = (routes_payload or {}).get("gateways", [])[:8]
+    ecosystem_terms = (routes_payload or {}).get("ecosystem_terms", [])[:20]
     has_working_path = any(route.get("type") not in {"near_miss"} for route in routes)
     nodes = {}
     edges = []
@@ -399,11 +439,59 @@ def board_from_routes(job_id, person, context, routes_payload):
                     "ask": (
                         "Validate this warm path before outreach."
                         if highlighted
-                        else "Best cold-email lead connected to the target-side map."
+                        else "Use this lead to create a bridge into the target ecosystem."
                     ),
                     "explanation": route.get("explanation", ""),
                 }
             )
+
+    for gateway_index, gateway in enumerate(gateways):
+        path = gateway.get("path", [])
+        route_index = len(routes) + gateway_index
+        for depth, person_item in enumerate(path):
+            node_id = board_node_id(person_item, depth)
+            role = "target" if depth == len(path) - 1 else "ecosystem" if depth > 1 else "lead" if depth > 0 else "me"
+            existing = nodes.get(node_id, {})
+            nodes[node_id] = {
+                "id": node_id,
+                "name": person_item.get("name", "Unknown"),
+                "company": person_item.get("company", ""),
+                "position": person_item.get("position", ""),
+                "profile_url": person_item.get("profile_url", ""),
+                "depth": depth,
+                "role": existing.get("role") if existing.get("role") == "target" else role,
+                "source": "path_creation",
+                "highlighted": bool(existing.get("highlighted")),
+                "route_count": int(existing.get("route_count", 0)) + 1,
+            }
+            if depth > 0:
+                source = board_node_id(path[depth - 1], depth - 1)
+                edges.append(
+                    {
+                        "key": f"{source}->{node_id}:gateway-{gateway_index}",
+                        "source": source,
+                        "target": node_id,
+                        "route": route_index,
+                        "type": "gateway",
+                        "highlighted": False,
+                    }
+                )
+        lead_person = gateway.get("profile") or (path[1] if len(path) > 1 else {})
+        leads.append(
+            {
+                "rank": len(leads) + 1,
+                "name": lead_person.get("name", ""),
+                "company": lead_person.get("company", ""),
+                "position": lead_person.get("position", ""),
+                "profile_url": lead_person.get("profile_url", ""),
+                "score": gateway.get("score", ""),
+                "type": "gateway",
+                "confidence": gateway.get("confidence", "path creation lead"),
+                "ask": "Create the path: ask for the nearest specific person in this ecosystem.",
+                "explanation": gateway.get("explanation", ""),
+                "creation_strategy": gateway.get("creation_strategy", ""),
+            }
+        )
 
     board = {
         "id": job_id,
@@ -412,8 +500,10 @@ def board_from_routes(job_id, person, context, routes_payload):
         "summary": {
             "working_paths": sum(1 for route in routes if route.get("type") != "near_miss"),
             "near_misses": sum(1 for route in routes if route.get("type") == "near_miss"),
+            "gateways": len(gateways),
             "leads": len(leads),
         },
+        "ecosystem_terms": ecosystem_terms,
         "nodes": list(nodes.values()),
         "edges": edges,
         "leads": leads,
