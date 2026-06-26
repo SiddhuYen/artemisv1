@@ -8,7 +8,8 @@ import ssl
 import subprocess
 import textwrap
 import time
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 from urllib.error import HTTPError, URLError
@@ -20,6 +21,8 @@ from search_agent.apify_client import ApifyClient
 DEFAULT_PROVIDER = "gemini"
 DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_PROFILES_CSV = "linkedin_network_profiles.csv"
+DEFAULT_CACHE_DIR = os.path.join(".cache", "dossiers")
+DEFAULT_CACHE_DAYS = 30
 
 
 class SearchResultParser(HTMLParser):
@@ -74,6 +77,91 @@ class TextExtractor(HTMLParser):
 
     def text(self):
         return " ".join(self.parts)
+
+
+def cache_slug(value):
+    slug = re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
+    return slug or "person"
+
+
+def dossier_cache_key(args):
+    """Return a stable cache key for inputs that materially affect dossier content."""
+    key_data = {
+        "person": args.person,
+        "context": args.context,
+        "provider": args.provider,
+        "model": args.model,
+        "max_results": args.max_results,
+        "max_pages": args.max_pages,
+        "search_provider": args.search_provider,
+        "use_apify_instagram": bool(args.use_apify_instagram),
+        "adjacent_pass": bool(args.adjacent_pass),
+        "max_adjacent_queries": args.max_adjacent_queries,
+        "institution_pass": bool(args.institution_pass),
+        "max_institution_queries": args.max_institution_queries,
+        "max_institution_followups": args.max_institution_followups,
+        "max_institution_pages": args.max_institution_pages,
+        "include_local_profiles": bool(args.include_local_profiles),
+        "local_matches": args.local_matches,
+        "profiles_csv": os.path.abspath(args.profiles_csv) if args.include_local_profiles else "",
+    }
+    raw = json.dumps(key_data, sort_keys=True, default=str)
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"{cache_slug(args.person)}_{cache_slug(args.context or 'no_context')}_{digest}"
+
+
+def cache_paths(args):
+    cache_dir = getattr(args, "cache_dir", DEFAULT_CACHE_DIR) or DEFAULT_CACHE_DIR
+    key = dossier_cache_key(args)
+    return (
+        os.path.join(cache_dir, f"{key}.md"),
+        os.path.join(cache_dir, f"{key}.json"),
+    )
+
+
+def read_cached_dossier(args):
+    if getattr(args, "force_refresh", False):
+        return None
+    cache_days = int(getattr(args, "cache_days", DEFAULT_CACHE_DAYS) or 0)
+    if cache_days <= 0:
+        return None
+    dossier_path, metadata_path = cache_paths(args)
+    if not os.path.exists(dossier_path) or not os.path.exists(metadata_path):
+        return None
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+            metadata = json.load(metadata_file)
+        created_at = datetime.fromisoformat(metadata.get("created_at", "").replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if datetime.now(timezone.utc) - created_at > timedelta(days=cache_days):
+        return None
+    with open(dossier_path, "r", encoding="utf-8") as dossier_file:
+        report = dossier_file.read()
+    print(f"Using cached dossier from {dossier_path} ({metadata.get('created_at', 'unknown date')}).", flush=True)
+    return report
+
+
+def write_cached_dossier(args, report):
+    cache_days = int(getattr(args, "cache_days", DEFAULT_CACHE_DAYS) or 0)
+    if cache_days <= 0:
+        return
+    dossier_path, metadata_path = cache_paths(args)
+    os.makedirs(os.path.dirname(dossier_path), exist_ok=True)
+    with open(dossier_path, "w", encoding="utf-8") as dossier_file:
+        dossier_file.write(report)
+    metadata = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "cache_days": cache_days,
+        "person": args.person,
+        "context": args.context,
+        "provider": args.provider,
+        "model": args.model,
+        "dossier_path": dossier_path,
+    }
+    with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2, sort_keys=True)
+    print(f"Cached dossier for up to {cache_days} day(s): {dossier_path}", flush=True)
 
 
 def ssl_context(allow_insecure_ssl=False):
@@ -857,6 +945,16 @@ def research_person(args):
             args.model = os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
         else:
             args.model = os.environ.get("OLLAMA_MODEL", "llama3.1")
+    if not hasattr(args, "cache_dir"):
+        args.cache_dir = DEFAULT_CACHE_DIR
+    if not hasattr(args, "cache_days"):
+        args.cache_days = DEFAULT_CACHE_DAYS
+    if not hasattr(args, "force_refresh"):
+        args.force_refresh = False
+
+    cached_report = read_cached_dossier(args)
+    if cached_report is not None:
+        return cached_report
     local_matches = []
     if args.include_local_profiles:
         local_matches = load_local_profile_matches(args.profiles_csv, args.person, args.local_matches)
@@ -921,12 +1019,14 @@ def research_person(args):
                     args.use_apify_instagram,
                 )
             )
-    return generate_text(
+    report = generate_text(
         args.provider,
         args.model,
         dossier_prompt(args.person, args.context, evidence, local_matches, args.include_local_profiles),
         allow_insecure_ssl=args.allow_insecure_ssl,
     )
+    write_cached_dossier(args, report)
+    return report
 
 
 def parse_args():
@@ -975,6 +1075,9 @@ def parse_args():
     parser.add_argument("--max-institution-followups", type=int, default=8, help="Max follow-up searches for found institutions and alumni/staff.")
     parser.add_argument("--max-institution-pages", type=int, default=6, help="Extra page-read budget for institution searches.")
     parser.add_argument("--output", default="", help="Write Markdown dossier to this file.")
+    parser.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR, help="Directory for cached dossiers.")
+    parser.add_argument("--cache-days", type=int, default=DEFAULT_CACHE_DAYS, help="Reuse cached dossiers newer than this many days. Use 0 to disable caching.")
+    parser.add_argument("--refresh", dest="force_refresh", action="store_true", help="Ignore any cached dossier and rebuild from fresh search results.")
     parser.add_argument(
         "--allow-insecure-ssl",
         action="store_true",

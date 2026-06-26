@@ -749,6 +749,9 @@ def run_job(job_id, payload):
         search_provider=payload.get("search_provider") or "brave",
         use_apify_instagram=bool(payload.get("use_apify_instagram")),
         allow_insecure_ssl=bool(payload.get("allow_insecure_ssl")),
+        cache_dir=os.path.join(DATA_DIR, ".cache", "dossiers"),
+        cache_days=int(payload.get("cache_days") or 30),
+        force_refresh=bool(payload.get("force_refresh")),
         extra_term=[],
         min_score=1,
         match_limit=int(payload.get("match_limit") or 50),
@@ -768,7 +771,8 @@ def run_job(job_id, payload):
         expansion_search_results=int(payload.get("expansion_search_results") or 4),
     )
     try:
-        update_job(job_id, status="running", message=f"Building dossier using {profiles_csv}...", log=f"Building dossier for {person}.")
+        cache_note = "fresh refresh requested" if args.force_refresh else f"cache up to {args.cache_days} day(s)"
+        update_job(job_id, status="running", message=f"Building dossier using {profiles_csv}...", log=f"Building dossier for {person} ({cache_note}).")
         research_person_and_network.build_dossier(args, person, context, dossier_path)
         update_job(job_id, files={"dossier": dossier_path}, dossier=read_file(dossier_path), log=f"Saved dossier: {dossier_path}")
         update_job(job_id, message="Checking graph/network matches...", log=f"Checking network matches in {profiles_csv}.")

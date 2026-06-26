@@ -36,6 +36,7 @@
             <label class="toggle"><input id="skipInstitution" type="checkbox"> Skip target-created institution search</label>
             <label class="toggle"><input id="verifyHops" type="checkbox" checked> Verify hops with exact bridging search</label>
             <label class="toggle"><input id="seedMap" type="checkbox" checked> Build seed-side relationship maps</label>
+            <div class="row"><div><label>Cache days</label><input id="cacheDays" type="number" min="0" max="365" value="30"></div><div><label>&nbsp;</label><label class="toggle inline-toggle"><input id="forceRefresh" type="checkbox"> Force fresh dossier</label></div></div>
             <div class="actions"><button id="runButton" class="primary" type="submit">Run Path Search</button><button class="secondary" type="button" id="clearButton">Clear</button></div>
           </form>
           <div id="jobMeta" class="markdown"><p>Uses <code>user_network_profiles.csv</code> after you upload a network. Falls back to <code>linkedin_network_profiles.csv</code>.</p></div>

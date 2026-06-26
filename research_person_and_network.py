@@ -44,6 +44,9 @@ def build_dossier(args, person, context, dossier_path):
         max_institution_pages=args.max_institution_pages,
         output=dossier_path,
         allow_insecure_ssl=args.allow_insecure_ssl,
+        cache_dir=args.cache_dir,
+        cache_days=args.cache_days,
+        force_refresh=args.force_refresh,
     )
     report = person_deep_research.research_person(research_args)
     with open(dossier_path, "w", encoding="utf-8") as dossier_file:
@@ -137,6 +140,9 @@ def parse_args():
     parser.add_argument("--match-limit", type=int, default=50, help="Max network matches to report.")
     parser.add_argument("--extra-term", action="append", default=[], help="Additional network match term; can repeat.")
     parser.add_argument("--allow-insecure-ssl", action="store_true")
+    parser.add_argument("--cache-dir", default=person_deep_research.DEFAULT_CACHE_DIR, help="Directory for cached dossiers.")
+    parser.add_argument("--cache-days", type=int, default=person_deep_research.DEFAULT_CACHE_DAYS, help="Reuse cached dossiers newer than this many days. Use 0 to disable caching.")
+    parser.add_argument("--refresh", dest="force_refresh", action="store_true", help="Ignore any cached dossier and rebuild from fresh search results.")
     parser.add_argument("--no-verify-hops", dest="verify_hops", action="store_false", help="Skip exact-name hop verification.")
     parser.set_defaults(verify_hops=True)
     parser.add_argument("--verify-limit", type=int, default=8, help="Max bridge candidates to verify.")
