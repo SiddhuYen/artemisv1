@@ -713,7 +713,7 @@ def board_from_routes(job_id, person, context, routes_payload):
     return board
 
 
-def new_board(name="Untitled Board"):
+def new_board(name="Untitled Board", client_id=""):
     board_id = f"{int(time.time() * 1000)}_{slugify(name)[:32]}"
     board = {
         "id": board_id,
@@ -739,6 +739,7 @@ def new_board(name="Untitled Board"):
         "edges": [],
         "leads": [],
         "saved": False,
+        "client_id": client_id,
         "updated_at": time.time(),
     }
     save_board(board)
@@ -757,7 +758,7 @@ def board_summary_item(board):
     }
 
 
-def list_boards():
+def list_boards(client_id=""):
     os.makedirs(BOARD_DIR, exist_ok=True)
     boards = []
     for filename in os.listdir(BOARD_DIR):
@@ -768,6 +769,8 @@ def list_boards():
                 board = json.load(file)
                 if not board.get("name"):
                     continue
+                if client_id and board.get("client_id") != client_id:
+                    continue
                 boards.append(board_summary_item(board))
         except Exception:
             continue
@@ -775,16 +778,16 @@ def list_boards():
     return boards
 
 
-def ensure_board(board_id=""):
+def ensure_board(board_id="", client_id=""):
     if board_id:
         try:
             return load_board(board_id)
         except ValueError:
             pass
-    boards = list_boards()
+    boards = list_boards(client_id)
     if boards:
         return load_board(boards[0]["id"])
-    return new_board("Untitled Board")
+    return new_board("Untitled Board", client_id=client_id)
 
 
 def recompute_board_summary(board):
@@ -1134,6 +1137,9 @@ class ResearchHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def client_id(self):
+        return re.sub(r"[^a-zA-Z0-9_.-]+", "_", self.headers.get("X-Artemis-Client-Id", "")).strip("._")
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/":
@@ -1146,8 +1152,8 @@ class ResearchHandler(BaseHTTPRequestHandler):
             self.send_json(graph_summary())
             return
         if parsed.path == "/api/boards":
-            board = ensure_board()
-            self.send_json({"boards": list_boards(), "current": board})
+            board = ensure_board(client_id=self.client_id())
+            self.send_json({"boards": list_boards(self.client_id()), "current": board, "data_dir": DATA_DIR})
             return
         if parsed.path.startswith("/api/jobs/"):
             job_id = parsed.path.rsplit("/", 1)[-1]
@@ -1220,7 +1226,7 @@ class ResearchHandler(BaseHTTPRequestHandler):
             if self.path == "/api/boards":
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                board = new_board((payload.get("name") or "Untitled Board").strip())
+                board = new_board((payload.get("name") or "Untitled Board").strip(), client_id=self.client_id())
                 self.send_json(board)
                 return
             if self.path.startswith("/api/boards/") and self.path.endswith("/save"):
@@ -1230,6 +1236,7 @@ class ResearchHandler(BaseHTTPRequestHandler):
                 board = load_board(board_id)
                 if payload.get("name") is not None:
                     board["name"] = (payload.get("name") or "Untitled Board").strip()
+                board["client_id"] = board.get("client_id") or self.client_id()
                 if payload.get("board"):
                     incoming = payload["board"]
                     for key in ("target", "context", "nodes", "edges", "leads", "ecosystem_terms", "summary"):

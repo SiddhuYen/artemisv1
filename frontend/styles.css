@@ -213,6 +213,36 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
   55% { transform: translateX(95%); }
   100% { transform: translateX(240%); }
 }
+.manual-tools {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 11px;
+  background: #fff;
+}
+.manual-tools h2 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+.manual-tools form {
+  display: grid;
+  gap: 7px;
+}
+.manual-tools form + form {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.manual-tools label {
+  margin: 0;
+}
+.manual-tools input,
+.manual-tools select {
+  min-height: 34px;
+}
+.manual-tools button {
+  min-height: 34px;
+}
 .hint {
   margin-top: 14px;
   border: 1px solid var(--line);

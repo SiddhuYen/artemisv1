@@ -7,6 +7,20 @@ let currentBoard = null;
 let selectedBoardNodeId = 'me';
 let selectedBoardEdgeIndex = null;
 let pollTimer = null;
+let dragState = null;
+const CLIENT_ID_KEY = 'artemisClientId';
+const clientId = localStorage.getItem(CLIENT_ID_KEY) || `client-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+localStorage.setItem(CLIENT_ID_KEY, clientId);
+
+function apiFetch(url, options = {}) {
+  return fetch(url, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      'X-Artemis-Client-Id': clientId,
+    },
+  });
+}
 
 function setStatus(status, label) {
   $('statusDot').className = `dot ${status || ''}`;
@@ -99,6 +113,7 @@ function collapseDuplicateBoardNodes(board) {
 function boardPositions(nodes, width, height) {
   const byDepth = {};
   nodes.forEach(node => {
+    if (Number.isFinite(Number(node.x)) && Number.isFinite(Number(node.y))) return;
     let depth = Number(node.depth || 1);
     if (node.role === 'me' || node.id === 'me') depth = 0;
     if (node.role === 'target') depth = 5;
@@ -119,6 +134,20 @@ function boardPositions(nodes, width, height) {
     });
   });
   return pos;
+}
+
+function ensureBoardPositions(board) {
+  const nodes = board.nodes || [];
+  const width = Math.max(1160, window.innerWidth - 420);
+  const height = Math.max(720, window.innerHeight - 82);
+  const generated = boardPositions(nodes, width, height);
+  nodes.forEach(node => {
+    if (!Number.isFinite(Number(node.x)) || !Number.isFinite(Number(node.y))) {
+      const p = generated.get(node.id) || {x: 80, y: 120};
+      node.x = Math.round(p.x);
+      node.y = Math.round(p.y);
+    }
+  });
 }
 
 function normalizeBoard(board) {
@@ -142,11 +171,12 @@ function normalizeBoard(board) {
     });
   }
   collapseDuplicateBoardNodes(board);
+  ensureBoardPositions(board);
   return board;
 }
 
 async function loadBoards(preferredId = '') {
-  const res = await fetch('/api/boards');
+  const res = await apiFetch('/api/boards');
   const data = await res.json();
   boards = data.boards || [];
   currentBoard = normalizeBoard(preferredId ? await fetchBoard(preferredId) : data.current);
@@ -155,7 +185,7 @@ async function loadBoards(preferredId = '') {
 }
 
 async function fetchBoard(id) {
-  const res = await fetch(`/api/boards/${encodeURIComponent(id)}`);
+  const res = await apiFetch(`/api/boards/${encodeURIComponent(id)}`);
   return res.ok ? res.json() : null;
 }
 
@@ -166,6 +196,7 @@ function renderBoardPicker() {
     $('boardName').value = currentBoard.name || currentBoard.target || 'Untitled Board';
     $('exportBoard').href = `/api/boards/${encodeURIComponent(currentBoard.id)}/csv`;
   }
+  renderManualEdgeOptions();
 }
 
 function renderBoard() {
@@ -175,7 +206,8 @@ function renderBoard() {
   const edges = currentBoard.edges || [];
   const width = Math.max(1160, window.innerWidth - 420);
   const height = Math.max(720, window.innerHeight - 82);
-  const pos = boardPositions(nodes, width, height);
+  ensureBoardPositions(currentBoard);
+  const pos = new Map(nodes.map(node => [node.id, {x: Number(node.x || 0), y: Number(node.y || 0)}]));
   const edgeSvg = edges.map((edge, edgeIndex) => {
     const a = pos.get(edge.source), b = pos.get(edge.target);
     if (!a || !b) return '';
@@ -186,12 +218,14 @@ function renderBoard() {
   }).join('');
   const nodeHtml = nodes.map(node => {
     const p = pos.get(node.id);
-    return `<button class="${nodeClass(node)}" data-board-node="${escapeHtml(node.id)}" style="left:${p.x}px;top:${p.y}px" title="${escapeHtml(personLabel(node))}">${escapeHtml(initials(node))}</button><div class="board-label" style="left:${p.x}px;top:${p.y + 72}px"><strong>${escapeHtml(node.name || 'Unknown')}</strong>${node.company ? escapeHtml(node.company) : ''}</div>`;
+    return `<button class="${nodeClass(node)}" data-board-node="${escapeHtml(node.id)}" style="left:${p.x}px;top:${p.y}px" title="${escapeHtml(personLabel(node))}">${escapeHtml(initials(node))}</button><div class="board-label" data-board-label="${escapeHtml(node.id)}" style="left:${p.x}px;top:${p.y + 72}px"><strong>${escapeHtml(node.name || 'Unknown')}</strong>${node.company ? escapeHtml(node.company) : ''}</div>`;
   }).join('');
   $('boardCanvas').innerHTML = `<div class="board-map" style="width:${width}px;height:${height}px"><svg class="edge-layer" viewBox="0 0 ${width} ${height}">${edgeSvg}</svg>${nodeHtml}</div>`;
   document.querySelectorAll('[data-board-node]').forEach(el => el.onclick = () => selectBoardNode(el.dataset.boardNode));
+  document.querySelectorAll('[data-board-node]').forEach(el => el.onpointerdown = startNodeDrag);
   document.querySelectorAll('[data-board-edge]').forEach(el => el.onclick = () => selectBoardEdge(Number(el.dataset.boardEdge)));
   selectBoardNode(selectedBoardNodeId, false);
+  renderManualEdgeOptions();
 }
 
 function selectBoardNode(id, rerender = true) {
@@ -262,6 +296,125 @@ function renderEdgeInspector(edge) {
     </div>`;
 }
 
+function renderManualEdgeOptions() {
+  if (!$('manualEdgeSource') || !$('manualEdgeTarget')) return;
+  const options = (currentBoard?.nodes || []).map(node => `<option value="${escapeHtml(node.id)}">${escapeHtml(node.name || node.id)}</option>`).join('');
+  $('manualEdgeSource').innerHTML = options;
+  $('manualEdgeTarget').innerHTML = options;
+}
+
+function markBoardDirty() {
+  if (!currentBoard) return;
+  currentBoard.saved = false;
+  setStatus('', 'Unsaved');
+}
+
+function uniqueManualNodeId(name) {
+  const base = `manual-${boardNodeId({name}, Date.now())}`;
+  const existing = new Set((currentBoard?.nodes || []).map(node => node.id));
+  let id = base;
+  let index = 2;
+  while (existing.has(id)) {
+    id = `${base}-${index}`;
+    index += 1;
+  }
+  return id;
+}
+
+function addManualBoardNode(payload) {
+  currentBoard = normalizeBoard(currentBoard);
+  const node = {
+    id: uniqueManualNodeId(payload.name),
+    name: payload.name,
+    company: payload.company || '',
+    position: payload.position || '',
+    profile_url: payload.profile_url || '',
+    depth: 2,
+    role: 'manual',
+    source: 'manual',
+    highlighted: false,
+    route_count: 0,
+    x: 180,
+    y: 160 + ((currentBoard.nodes || []).length % 6) * 92,
+  };
+  currentBoard.nodes.push(node);
+  selectedBoardNodeId = node.id;
+  markBoardDirty();
+  renderBoard();
+}
+
+function addManualBoardEdge(payload) {
+  if (!payload.source || !payload.target || payload.source === payload.target) return;
+  currentBoard.edges ||= [];
+  const key = `${payload.source}->${payload.target}:manual-${Date.now()}`;
+  currentBoard.edges.push({
+    key,
+    source: payload.source,
+    target: payload.target,
+    route: 'manual',
+    type: 'manual',
+    highlighted: false,
+    reason: payload.reason || 'Manually added board connection.',
+    evidence: payload.reason || '',
+    source_url: payload.source_url || '',
+    confidence: 'manual',
+  });
+  markBoardDirty();
+  renderBoard();
+}
+
+function startNodeDrag(event) {
+  if (event.button !== 0) return;
+  const id = event.currentTarget.dataset.boardNode;
+  const node = (currentBoard?.nodes || []).find(item => item.id === id);
+  if (!node) return;
+  dragState = {
+    id,
+    node,
+    startX: event.clientX,
+    startY: event.clientY,
+    nodeX: Number(node.x || 0),
+    nodeY: Number(node.y || 0),
+    moved: false,
+  };
+  event.currentTarget.setPointerCapture(event.pointerId);
+  event.currentTarget.onpointermove = dragNode;
+  event.currentTarget.onpointerup = endNodeDrag;
+  event.currentTarget.onpointercancel = endNodeDrag;
+}
+
+function dragNode(event) {
+  if (!dragState) return;
+  const dx = event.clientX - dragState.startX;
+  const dy = event.clientY - dragState.startY;
+  if (Math.abs(dx) + Math.abs(dy) > 3) dragState.moved = true;
+  dragState.node.x = Math.max(10, Math.round(dragState.nodeX + dx));
+  dragState.node.y = Math.max(10, Math.round(dragState.nodeY + dy));
+  const nodeEl = document.querySelector(`[data-board-node="${CSS.escape(dragState.id)}"]`);
+  const labelEl = document.querySelector(`[data-board-label="${CSS.escape(dragState.id)}"]`);
+  if (nodeEl) {
+    nodeEl.style.left = `${dragState.node.x}px`;
+    nodeEl.style.top = `${dragState.node.y}px`;
+  }
+  if (labelEl) {
+    labelEl.style.left = `${dragState.node.x}px`;
+    labelEl.style.top = `${dragState.node.y + 72}px`;
+  }
+}
+
+function endNodeDrag(event) {
+  if (!dragState) return;
+  const moved = dragState.moved;
+  event.currentTarget.onpointermove = null;
+  event.currentTarget.onpointerup = null;
+  event.currentTarget.onpointercancel = null;
+  if (moved) {
+    markBoardDirty();
+    renderBoard();
+  }
+  dragState = null;
+}
+
 function payloadForRun(person, context = '') {
   return {
     board_id: currentBoard?.id,
@@ -287,7 +440,7 @@ async function runResearch(person, context = '') {
   if (!currentBoard) await loadBoards();
   setStatus('running', 'Starting');
   setProgressDetail(`Preparing research for ${person}.`);
-  const res = await fetch('/api/research', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payloadForRun(person, context))});
+  const res = await apiFetch('/api/research', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payloadForRun(person, context))});
   const data = await res.json();
   if (!res.ok) {
     setStatus('error', 'Error');
@@ -299,7 +452,7 @@ async function runResearch(person, context = '') {
 
 async function pollJob(id) {
   if (pollTimer) clearTimeout(pollTimer);
-  const res = await fetch(`/api/jobs/${id}`);
+  const res = await apiFetch(`/api/jobs/${id}`);
   const job = await res.json();
   setStatus(job.status === 'done' ? 'done' : job.status === 'error' ? 'error' : 'running', job.status === 'done' ? 'Complete' : job.status === 'error' ? 'Error' : 'Running');
   setProgressDetail(job.message || (job.log || []).slice(-1)[0] || 'Working...');
@@ -314,7 +467,7 @@ async function pollJob(id) {
 }
 
 async function refreshBoardListOnly() {
-  const res = await fetch('/api/boards');
+  const res = await apiFetch('/api/boards');
   const data = await res.json();
   boards = data.boards || [];
 }
@@ -334,7 +487,7 @@ $('boardSelect').onchange = async () => {
 
 $('newBoard').onclick = async () => {
   const name = prompt('Board name', 'Untitled Board') || 'Untitled Board';
-  const res = await fetch('/api/boards', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name})});
+  const res = await apiFetch('/api/boards', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name})});
   currentBoard = normalizeBoard(await res.json());
   await loadBoards(currentBoard.id);
 };
@@ -342,10 +495,33 @@ $('newBoard').onclick = async () => {
 $('saveBoard').onclick = async () => {
   if (!currentBoard) return;
   currentBoard.name = $('boardName').value.trim() || 'Untitled Board';
-  const res = await fetch(`/api/boards/${encodeURIComponent(currentBoard.id)}/save`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: currentBoard.name, board: currentBoard})});
+  const res = await apiFetch(`/api/boards/${encodeURIComponent(currentBoard.id)}/save`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: currentBoard.name, board: currentBoard})});
   currentBoard = normalizeBoard(await res.json());
   await loadBoards(currentBoard.id);
   setStatus('done', 'Saved');
+};
+
+$('manualBoardNodeForm').onsubmit = (e) => {
+  e.preventDefault();
+  addManualBoardNode({
+    name: $('manualBoardName').value.trim(),
+    company: $('manualBoardCompany').value.trim(),
+    position: $('manualBoardPosition').value.trim(),
+    profile_url: $('manualBoardUrl').value.trim(),
+  });
+  $('manualBoardNodeForm').reset();
+};
+
+$('manualBoardEdgeForm').onsubmit = (e) => {
+  e.preventDefault();
+  addManualBoardEdge({
+    source: $('manualEdgeSource').value,
+    target: $('manualEdgeTarget').value,
+    reason: $('manualEdgeReason').value.trim(),
+    source_url: $('manualEdgeUrl').value.trim(),
+  });
+  $('manualEdgeReason').value = '';
+  $('manualEdgeUrl').value = '';
 };
 
 $('researchForm').onsubmit = async (e) => {

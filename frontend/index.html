@@ -66,7 +66,27 @@
           <div class="progress-meta"><strong id="progressTitle">Running</strong><span id="progressDetail">Starting workflow...</span></div>
           <div class="progress-track"><span></span></div>
         </div>
+        <section class="manual-tools">
+          <h2>Edit Board</h2>
+          <form id="manualBoardNodeForm">
+            <label>Add node</label>
+            <input id="manualBoardName" placeholder="Name" required>
+            <input id="manualBoardCompany" placeholder="Company">
+            <input id="manualBoardPosition" placeholder="Role / note">
+            <input id="manualBoardUrl" placeholder="URL">
+            <button class="secondary" type="submit">Add Node</button>
+          </form>
+          <form id="manualBoardEdgeForm">
+            <label>Add edge</label>
+            <select id="manualEdgeSource"></select>
+            <select id="manualEdgeTarget"></select>
+            <input id="manualEdgeReason" placeholder="Why this connection exists">
+            <input id="manualEdgeUrl" placeholder="Source URL">
+            <button class="secondary" type="submit">Add Edge</button>
+          </form>
+        </section>
         <div id="runHint" class="hint">Click a cold-start or lead node to run toward it while preserving the original target.</div>
+        <div class="hint">Boards save locally on this computer when you click Save.</div>
       </aside>
 
       <section class="board-stage-main">
