@@ -267,6 +267,7 @@ function renderNodeInspector(node) {
         ${canRun ? `<button class="primary" type="button" id="runNode">Run Toward Node</button>` : ''}
         ${downloadLink(node.dossier_path, 'Dossier')}
         ${downloadLink(node.matches_path, 'Report')}
+        ${node.id !== 'me' ? `<button class="danger" type="button" id="deleteNode">Delete Node</button>` : ''}
       </div>
     </div>`;
 }
@@ -359,6 +360,20 @@ function addManualBoardEdge(payload) {
     source_url: payload.source_url || '',
     confidence: 'manual',
   });
+  markBoardDirty();
+  renderBoard();
+}
+
+function deleteBoardNode(nodeId) {
+  if (!currentBoard || nodeId === 'me') return;
+  const node = (currentBoard.nodes || []).find(item => item.id === nodeId);
+  if (!node) return;
+  if (!confirm(`Delete ${node.name || 'this node'} and its edges?`)) return;
+  currentBoard.nodes = (currentBoard.nodes || []).filter(item => item.id !== nodeId);
+  currentBoard.edges = (currentBoard.edges || []).filter(edge => edge.source !== nodeId && edge.target !== nodeId);
+  currentBoard.leads = (currentBoard.leads || []).filter(lead => normalizeName(lead.name) !== normalizeName(node.name));
+  selectedBoardNodeId = 'me';
+  selectedBoardEdgeIndex = null;
   markBoardDirty();
   renderBoard();
 }
@@ -530,12 +545,17 @@ $('researchForm').onsubmit = async (e) => {
 };
 
 $('nodeInspector').onclick = async (e) => {
-  if (e.target?.id !== 'runNode') return;
   const node = (currentBoard?.nodes || []).find(item => item.id === selectedBoardNodeId);
-  if (!node) return;
-  $('person').value = node.name || '';
-  $('context').value = node.company || node.position || '';
-  await runResearch(node.name, node.company || node.position || '');
+  if (e.target?.id === 'deleteNode') {
+    deleteBoardNode(selectedBoardNodeId);
+    return;
+  }
+  if (e.target?.id === 'runNode') {
+    if (!node) return;
+    $('person').value = node.name || '';
+    $('context').value = node.company || node.position || '';
+    await runResearch(node.name, node.company || node.position || '');
+  }
 };
 
 async function loadNetwork() {

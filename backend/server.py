@@ -45,6 +45,11 @@ def normalize_url(url):
     return str(url or "").strip().split("?", 1)[0].rstrip("/")
 
 
+def safe_filename(value, fallback="item"):
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(value or "")).strip("._")
+    return safe or fallback
+
+
 def person_id(person):
     url = normalize_url(person.get("profile_url") or person.get("URL"))
     if url:
@@ -385,6 +390,7 @@ def route_payload(dossier_path, profiles_csv, extra_terms, min_score, limit, mat
             rejected_candidates=[],
             limit=min(limit, 8),
         )
+        near_misses = [item for item in near_misses if item.get("kind") != "broad_clue"]
         for index, item in enumerate(near_misses, 1):
             row = item["row"]
             snippets = item.get("snippets", [])[:8]
@@ -759,13 +765,15 @@ def board_summary_item(board):
 
 
 def list_boards(client_id=""):
-    os.makedirs(BOARD_DIR, exist_ok=True)
+    root = client_board_root(client_id)
+    os.makedirs(root, exist_ok=True)
     boards = []
-    for filename in os.listdir(BOARD_DIR):
-        if not filename.endswith(".json"):
+    for dirname in os.listdir(root):
+        path = os.path.join(root, dirname, "board.json")
+        if not os.path.exists(path):
             continue
         try:
-            with open(os.path.join(BOARD_DIR, filename), "r", encoding="utf-8") as file:
+            with open(path, "r", encoding="utf-8") as file:
                 board = json.load(file)
                 if not board.get("name"):
                     continue
@@ -775,6 +783,18 @@ def list_boards(client_id=""):
         except Exception:
             continue
     boards.sort(key=lambda item: item.get("updated_at", 0), reverse=True)
+    if not client_id:
+        for filename in os.listdir(BOARD_DIR):
+            legacy_path = os.path.join(BOARD_DIR, filename)
+            if not filename.endswith(".json") or not os.path.isfile(legacy_path):
+                continue
+            try:
+                with open(legacy_path, "r", encoding="utf-8") as file:
+                    board = json.load(file)
+                    if board.get("name"):
+                        boards.append(board_summary_item(board))
+            except Exception:
+                continue
     return boards
 
 
@@ -887,15 +907,35 @@ def merge_boards(base, incoming, run_person, run_context, dossier_path="", match
 
 
 def board_path(board_id):
-    safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(board_id or "")).strip("._")
+    safe_id = safe_filename(board_id, "")
     if not safe_id:
         raise ValueError("Board id is required.")
-    return os.path.join(BOARD_DIR, f"{safe_id}.json")
+    for client_name in os.listdir(BOARD_DIR) if os.path.exists(BOARD_DIR) else []:
+        path = os.path.join(BOARD_DIR, client_name, safe_id, "board.json")
+        if os.path.exists(path):
+            return path
+    legacy_path = os.path.join(BOARD_DIR, f"{safe_id}.json")
+    if os.path.exists(legacy_path):
+        return legacy_path
+    return os.path.join(BOARD_DIR, "unscoped", safe_id, "board.json")
+
+
+def client_board_root(client_id=""):
+    return os.path.join(BOARD_DIR, safe_filename(client_id, "unscoped"))
+
+
+def board_storage_path(board):
+    client_id = board.get("client_id", "")
+    board_id = board.get("id", "")
+    if not board_id:
+        raise ValueError("Board id is required.")
+    return os.path.join(client_board_root(client_id), safe_filename(board_id), "board.json")
 
 
 def save_board(board):
-    os.makedirs(BOARD_DIR, exist_ok=True)
-    with open(board_path(board["id"]), "w", encoding="utf-8") as file:
+    path = board_storage_path(board)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
         json.dump(board, file, indent=2)
 
 
@@ -904,7 +944,8 @@ def load_board(board_id):
     if not os.path.exists(path):
         raise ValueError("Board not found.")
     with open(path, "r", encoding="utf-8") as file:
-        return json.load(file)
+        board = json.load(file)
+    return board
 
 
 def add_board_node(board_id, payload):
@@ -1165,6 +1206,8 @@ class ResearchHandler(BaseHTTPRequestHandler):
             board_id = parsed.path.split("/")[-2]
             try:
                 board = load_board(board_id)
+                if self.client_id() and board.get("client_id") and board.get("client_id") != self.client_id():
+                    raise ValueError("Board not found.")
             except ValueError as error:
                 self.send_json({"error": str(error)}, status=404)
                 return
@@ -1182,6 +1225,8 @@ class ResearchHandler(BaseHTTPRequestHandler):
             board_id = parsed.path.split("/")[-2]
             try:
                 board = load_board(board_id)
+                if self.client_id() and board.get("client_id") and board.get("client_id") != self.client_id():
+                    raise ValueError("Board not found.")
             except ValueError as error:
                 self.send_json({"error": str(error)}, status=404)
                 return
@@ -1193,7 +1238,10 @@ class ResearchHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/boards/"):
             board_id = parsed.path.rsplit("/", 1)[-1]
             try:
-                self.send_json(load_board(board_id))
+                board = load_board(board_id)
+                if self.client_id() and board.get("client_id") and board.get("client_id") != self.client_id():
+                    raise ValueError("Board not found.")
+                self.send_json(board)
             except ValueError as error:
                 self.send_json({"error": str(error)}, status=404)
             return
@@ -1236,7 +1284,7 @@ class ResearchHandler(BaseHTTPRequestHandler):
                 board = load_board(board_id)
                 if payload.get("name") is not None:
                     board["name"] = (payload.get("name") or "Untitled Board").strip()
-                board["client_id"] = board.get("client_id") or self.client_id()
+                board["client_id"] = self.client_id() or board.get("client_id", "")
                 if payload.get("board"):
                     incoming = payload["board"]
                     for key in ("target", "context", "nodes", "edges", "leads", "ecosystem_terms", "summary"):
