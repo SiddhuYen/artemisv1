@@ -737,7 +737,7 @@ def target_chain_for_node(node, artemis_map):
     return [node.get("name", ""), target]
 
 
-def verify_hop(row, target_node, seed_map, artemis_map, options):
+def verify_hop(row, target_node, seed_map, artemis_map, options, screen_evidence=None):
     import person_deep_research
 
     person = profile_payload(row)
@@ -749,7 +749,15 @@ def verify_hop(row, target_node, seed_map, artemis_map, options):
         ]
     )
     evidence = []
-    for query in queries[:2]:
+    # The Stage-3 screen already ran the first ("A" "B") query; reuse those
+    # results and only run the remaining (org-specific) query so deep
+    # verification does not pay for a duplicate search.
+    if screen_evidence:
+        evidence.extend(screen_evidence)
+        queries_to_run = queries[1:2]
+    else:
+        queries_to_run = queries[:2]
+    for query in queries_to_run:
         evidence.extend(
             evidence_items_for_query(
                 query,
@@ -834,12 +842,98 @@ Search evidence:
     return data
 
 
+def _name_tokens(name):
+    return [token for token in normalize(name).split() if len(token) >= 3]
+
+
+def _name_in_text(name, text_norm):
+    """Lenient presence test for a person/org name in already-normalized text."""
+    full = normalize(name)
+    if not full or not text_norm:
+        return False
+    if full in text_norm:
+        return True
+    tokens = _name_tokens(name)
+    if len(tokens) >= 2:
+        # Require the most distinctive tokens (first + last) to both appear.
+        return tokens[0] in text_norm and tokens[-1] in text_norm
+    return bool(tokens) and tokens[0] in text_norm
+
+
+def _evidence_text(item):
+    return normalize(" ".join(str(item.get(key, "")) for key in ("title", "text", "url")))
+
+
+def co_mention_in_evidence(evidence, person_name, target_name):
+    """True if any search result plausibly names BOTH people."""
+    for item in evidence:
+        text_norm = _evidence_text(item)
+        if _name_in_text(person_name, text_norm) and _name_in_text(target_name, text_norm):
+            return True
+    return False
+
+
+def screen_candidate(row, target_nodes, options):
+    """Stage 3 — cheap, zero-LLM pre-verification screen.
+
+    Runs ONE search per target node (`"Person A" "Person B"`) and keeps only the
+    first node whose results actually co-mention both names. Returns the node(s)
+    worth a full (Gemini) verification plus the evidence already fetched, so the
+    deep step reuses it instead of searching the same query again.
+
+    Fails OPEN on a search error so a transient search problem never silently
+    drops a real candidate.
+    """
+    person_name = profile_payload(row)["name"]
+    screen_results = getattr(options, "verify_screen_results", 3)
+    evidence_by_name = {}
+    search_failed = False
+    for target_node in target_nodes:
+        target_name = target_node.get("name", "")
+        if not target_name:
+            continue
+        evidence = evidence_items_for_query(
+            f'"{person_name}" "{target_name}"',
+            screen_results,
+            options.allow_insecure_ssl,
+            options.search_provider,
+        )
+        if any(item.get("title") == "Search failed" for item in evidence):
+            search_failed = True
+        evidence_by_name[normalize(target_name)] = evidence
+        if co_mention_in_evidence(evidence, person_name, target_name):
+            # Best (closest) nodes come first, so the first hit is the one to verify.
+            return {"passed": True, "nodes": [target_node], "evidence_by_name": evidence_by_name, "reason": ""}
+    if search_failed:
+        # Could not screen reliably; let the deep verifier decide.
+        return {
+            "passed": True,
+            "nodes": target_nodes,
+            "evidence_by_name": evidence_by_name,
+            "reason": "screen inconclusive (search unavailable)",
+        }
+    return {
+        "passed": False,
+        "nodes": [],
+        "evidence_by_name": evidence_by_name,
+        "reason": "No public page named both people, so deep verification was skipped to save cost.",
+    }
+
+
 def verify_candidate_matches(matches, artemis_map, options):
+    """Tiered verification.
+
+    Stage 2 takes the top candidates (already score-sorted) up to verify_limit.
+    Stage 3 runs a cheap, zero-LLM co-mention screen. Only screened-in
+    candidates reach Stage 4, where the expensive seed map and the full
+    Gemini-backed verify_hop run. This keeps deep verification to the handful of
+    candidates with real public co-mentions instead of every candidate.
+    """
     verified_paths = []
     rejected_candidates = []
+    screen_enabled = getattr(options, "verify_screen", True)
     for match in matches[: options.verify_limit]:
         row = match["row"]
-        seed_map = build_seed_map(row, options) if options.seed_map else {"relationships": []}
         target_nodes = match.get("target_nodes") or match.get("target_people") or []
         if not target_nodes:
             rejected_candidates.append(
@@ -847,13 +941,42 @@ def verify_candidate_matches(matches, artemis_map, options):
                     "match": match,
                     "target_node": {},
                     "verification": {"verified": False, "rejection_reason": "No specific target-side node matched."},
-                    "seed_map": seed_map,
+                    "seed_map": {"relationships": []},
                 }
             )
             continue
+
+        nodes_to_verify = target_nodes[: options.verify_targets_per_match]
+        screen_evidence_by_name = {}
+        if screen_enabled:
+            screened = screen_candidate(row, nodes_to_verify, options)
+            if not screened["passed"]:
+                best_node = nodes_to_verify[0] if nodes_to_verify else {}
+                rejected_candidates.append(
+                    {
+                        "match": match,
+                        "target_node": best_node,
+                        "verification": {
+                            "verified": False,
+                            "rejection_reason": screened["reason"],
+                            "screened_out": True,
+                        },
+                        "seed_map": {"relationships": []},
+                    }
+                )
+                continue
+            nodes_to_verify = screened["nodes"] or nodes_to_verify
+            screen_evidence_by_name = screened.get("evidence_by_name", {})
+
+        # Stage 4 — deep verification only for screened-in candidates. Build the
+        # expensive seed map lazily, now that it can actually pay off.
+        seed_map = build_seed_map(row, options) if options.seed_map else {"relationships": []}
         any_verified = False
-        for target_node in target_nodes[: options.verify_targets_per_match]:
-            verification = verify_hop(row, target_node, seed_map, artemis_map, options)
+        for target_node in nodes_to_verify:
+            screen_evidence = screen_evidence_by_name.get(normalize(target_node.get("name", "")))
+            verification = verify_hop(
+                row, target_node, seed_map, artemis_map, options, screen_evidence=screen_evidence
+            )
             item = {
                 "match": match,
                 "target_node": target_node,
@@ -1546,6 +1669,9 @@ def parse_args():
     parser.add_argument("--verified-path-limit", type=int, default=3, help="Stop after this many verified paths.")
     parser.add_argument("--verify-targets-per-match", type=int, default=2, help="Max target-side nodes to test per candidate.")
     parser.add_argument("--verify-search-results", type=int, default=5, help="Search results per exact-name bridging query.")
+    parser.add_argument("--no-verify-screen", dest="verify_screen", action="store_false", help="Skip the cheap co-mention screen and deep-verify every candidate (more tokens).")
+    parser.set_defaults(verify_screen=True)
+    parser.add_argument("--verify-screen-results", type=int, default=3, help="Search results fetched for the lightweight co-mention screen.")
     parser.add_argument("--seed-search-results", type=int, default=4, help="Search results for seed-side relationship mapping.")
     parser.add_argument("--no-seed-map", dest="seed_map", action="store_false", help="Skip seed-side relationship-map synthesis.")
     parser.set_defaults(seed_map=True)
