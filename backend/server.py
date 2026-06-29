@@ -976,6 +976,8 @@ def run_job(job_id, payload):
         verified_path_limit=int(payload.get("verified_path_limit") or 3),
         verify_targets_per_match=int(payload.get("verify_targets_per_match") or 2),
         verify_search_results=int(payload.get("verify_search_results") or 5),
+        verify_screen=not bool(payload.get("no_verify_screen")),
+        verify_screen_results=int(payload.get("verify_screen_results") or 3),
         seed_search_results=int(payload.get("seed_search_results") or 4),
         seed_map=not bool(payload.get("no_seed_map")),
         layer_expansion=not bool(payload.get("no_layer_expansion")),

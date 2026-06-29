@@ -95,19 +95,32 @@ target research
 -> Artemis Target Map
 -> endpoint-side second layer
 -> local graph bridge candidates
--> seed-side relationship map
--> exact-name bridging search
+-> lightweight co-mention screen (Stage 3, no LLM)
+-> seed-side relationship map        (only screened-in candidates)
+-> exact-name bridging search        (only screened-in candidates)
 -> verified paths / rejected candidates / research clues
 ```
 
 A candidate bridge only becomes a verified path if the verifier finds a cited, named professional relationship between the local-network person and the endpoint-side node. Shared employer, shared broad field, same large school, or generic title overlap is rejected.
 
+To keep token use down, verification is tiered. Stage 3 runs one cheap
+`"Person A" "Person B"` search per candidate and checks whether any result
+actually names both people. Candidates with no public co-mention are dropped
+immediately, with no Gemini call and no seed-map search. Only screened-in
+candidates reach the expensive seed map and exact-name verification, and the
+screen's search results are reused so the deep step does not repeat the same
+query. On a typical target this cuts verification LLM calls by roughly 75-80%
+with no change to which real paths are confirmed. The screen fails open: if
+search is unavailable, the candidate falls through to full verification.
+
 Useful switches:
 
 ```bash
---no-verify-hops       # cheaper/faster, but returns candidates instead of verified paths
---verify-limit 8       # max bridge candidates to verify
---no-seed-map          # skip seed-side relationship-map synthesis
+--no-verify-hops          # cheaper/faster, but returns candidates instead of verified paths
+--verify-limit 8          # max bridge candidates to consider
+--no-verify-screen        # deep-verify every candidate (skips the Stage 3 screen; more tokens)
+--verify-screen-results 3 # search results fetched for the lightweight screen
+--no-seed-map             # skip seed-side relationship-map synthesis
 ```
 
 ## Required Environment
